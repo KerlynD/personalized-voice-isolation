@@ -460,7 +460,11 @@ def main(argv=None):
     p.add_argument("--device", default="cpu", help="cpu, or cuda if you have it")
     a = p.parse_args(argv)
 
-    dsp.limit_torch_threads()
+    # Deliberately NOT calling dsp.limit_torch_threads() here. That exists to
+    # keep ECAPA off the cores the audio callback needs, which only matters
+    # while a realtime stream is open. The probe is an offline batch job with
+    # no callback to starve, so it should use every core it can get: this model
+    # is non-causal and runs many times slower than real time.
 
     names, cents = None, None
     if pathlib.Path(a.speakers).exists():

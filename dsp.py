@@ -70,12 +70,16 @@ def load_encoder(device="cpu"):
 
 
 def limit_torch_threads(n=1):
-    """Keep torch off the audio thread's cores.
+    """Keep torch off the audio thread's cores. For live.py only.
 
     ECAPA runs every ANALYZE_EVERY seconds in a background thread. Left to its
     defaults torch will spread that across every core, which is exactly the
     kind of CPU contention that turns into dropouts on the realtime callback.
     One thread is plenty for a 1.5 s window.
+
+    enroll.py and probe.py do not call this. Neither has an audio callback
+    running while it computes (enroll.py blocks on sd.wait() before embedding),
+    so throttling them would only make them slower.
     """
     torch.set_num_threads(n)
 

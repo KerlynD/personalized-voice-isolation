@@ -169,7 +169,6 @@ def main():
               "that silently never opens.")
         input("[Enter] to continue with the default > ")
 
-    dsp.limit_torch_threads()
     encoder = dsp.load_encoder()
     denoiser = dsp.Denoiser()
 
