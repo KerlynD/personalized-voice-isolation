@@ -1,0 +1,41 @@
+# Target interpreter: Python 3.11.
+#
+#   python3.11 -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Versions are pinned rather than floored because several of these packages
+# fetch model weights keyed to their own version. An unpinned upgrade can
+# silently change the embedding you enrolled against, which shows up as a
+# threshold problem rather than as an error.
+
+# --- realtime path: enroll.py, live.py, dsp.py ----------------------------
+# numpy 1.26 rather than 2.x: onnxruntime and speechbrain both grew numpy 2
+# support late, and nothing here needs a 2.x feature.
+numpy==1.26.4
+scipy==1.13.1          # dsp.to_analysis: resample_poly, 48k -> 16k anti-aliased
+torch==2.6.0           # ECAPA-TDNN backend only. deepfilter-stream is ONNX, no torch.
+speechbrain==1.0.2     # dsp.load_encoder uses speechbrain.inference (1.x API)
+sounddevice==0.5.1     # live.py PortAudio duplex stream
+soundfile==0.12.1      # enroll.py reference clips, live.py --record-debug, probe.py
+deepfilter-stream==0.1.0
+
+# Transitive via deepfilter-stream, pinned so that a rebuilt venv runs the same
+# ONNX graph through the same resampler as the venv you calibrated on.
+onnxruntime==1.20.1
+soxr==0.5.0.post1
+platformdirs==4.3.6
+
+# --- probe.py -------------------------------------------------------------
+# asteroid is heavy and its tree is brittle: 0.7.0 was released against an older
+# torch and an older huggingface-hub, and it declares torchmetrics<=0.11.4 while
+# also requiring pytorch-lightning>=2.0.0. The pins below satisfy both. None of
+# it runs in the realtime path; probe.py only needs asteroid at import time,
+# because its lightning import is lazy inside serialize(), which we never call.
+asteroid==0.7.0
+asteroid-filterbanks==0.4.0
+pytorch-lightning==2.0.9
+torchmetrics==0.11.4
+torchaudio==2.6.0        # must match torch above
+huggingface-hub==0.25.2  # asteroid 0.7.0 imports huggingface_hub at module load
+PyYAML==6.0.2
+pandas==2.2.3
