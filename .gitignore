@@ -216,3 +216,34 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# personalized-voice-isolation
+# ---------------------------------------------------------------------------
+
+# Enrollment centroids. These are biometric data derived from a real person's
+# voice. An ECAPA centroid is not reversible into audio, but it is a stable
+# identifier that matches its owner across recordings, so treat it like one.
+speakers.npz
+*.npz
+
+# Downloaded model weights. Nothing here is ours to redistribute, and the
+# TD-SpeakerBeam checkpoint in particular is under a BUT/NTT evaluation-only
+# licence that forbids redistribution outright. See the probe section of
+# README.md.
+models/
+
+# Debug captures and any other audio. These contain real speech, usually of
+# people who did not consent to being committed to a public repository.
+*.wav
+*.flac
+*.ogg
+probe_out/
+
+# Virtual environments used by this project.
+.venv/
+.venv-probe/
+
+# Reference recordings from enroll.py. Raw speech, same reasoning as the
+# debug captures above.
+clips/
