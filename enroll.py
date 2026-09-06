@@ -82,11 +82,32 @@ DEFAULT_THRESHOLD = 0.35
 # this you are averaging almost the same window with itself.
 MIN_WINDOWS_PER_CLIP = 3
 
+# Cycled through the target's clips so the voiceprint covers a range of
+# deliveries rather than eight takes of the same sentence at the same volume.
+DELIVERY = [
+    "normal speaking voice, how you sound on a call",
+    "a bit quieter, like it is late and someone is asleep",
+    "louder and more animated, like you are excited about something",
+    "normal again, but lean back away from the mic",
+    "normal, but lean in close to the mic",
+    "faster, like you are telling a story you are into",
+    "slower and lower, like you are explaining something carefully",
+    "normal speaking voice again",
+]
 
-def record(seconds, prompt, device=None):
-    input(f"\n{prompt}\n  [Enter] to start, then talk for {seconds:.0f}s > ")
-    buf = sd.rec(int(seconds * dsp.SR), samplerate=dsp.SR, channels=1,
-                 dtype="float32", device=device)
+
+def record(seconds, header, instructions, device=None, channel=0):
+    """Prompt, then capture `seconds` of one channel of `device`.
+
+    sd.rec's `mapping` counts channels from 1 the way macOS does, while the
+    rest of this project counts from 0 the way the arrays do, hence the +1.
+    """
+    print(f"\n{header}")
+    for line in instructions:
+        print(f"    {line}")
+    input(f"  [Enter] to start recording {seconds:.0f}s > ")
+    buf = sd.rec(int(seconds * dsp.SR), samplerate=dsp.SR,
+                 dtype="float32", device=device, mapping=[channel + 1])
     sd.wait()
     wav = np.ascontiguousarray(buf[:, 0])
     rms = float(np.sqrt(np.mean(wav**2)))
@@ -176,6 +197,10 @@ def main():
                     help="clips of people who should NOT pass the gate")
     ap.add_argument("--device", type=int, default=None,
                     help="input device index; use --list-devices to find it")
+    ap.add_argument("--channel", type=int, default=0, metavar="N",
+                    help="which input channel carries the mic, counting from 0. "
+                         "Must match live.py --in-channel, or you enroll on one "
+                         "microphone and run on another.")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--add", action="store_true",
                     help="append to an existing enrollment instead of replacing")
@@ -203,19 +228,66 @@ def main():
               "that silently never opens.")
         input("[Enter] to continue with the default > ")
 
+    # A fresh enrollment replaces the voiceprint, so it has to replace the
+    # clips too. probe.py reads every wav in clips/<name>/, so a leftover clip
+    # from a previous run would silently become part of the probe's reference
+    # audio, which is exactly the kind of stale-data bug that looks like a bad
+    # model result.
+    if not args.add:
+        stale = sorted((pathlib.Path(args.clip_dir) / args.name).glob("*.wav"))
+        stale += sorted((pathlib.Path(args.clip_dir) / "_impostors").glob("*.wav"))
+        if stale:
+            print(f"\n{len(stale)} clip(s) from a previous enrollment will be "
+                  f"deleted:")
+            for f in stale[:4]:
+                print(f"    {f}")
+            if len(stale) > 4:
+                print(f"    ... and {len(stale) - 4} more")
+            print("Move them elsewhere now if you want to keep them.")
+            input("[Enter] to delete and continue, Ctrl+C to abort > ")
+            for f in stale:
+                f.unlink()
+
     encoder = dsp.load_encoder()
     denoiser = dsp.Denoiser()
 
-    print(f"\nEach {args.seconds:.0f}s clip becomes about "
-          f"{int((args.seconds - dsp.WINDOW_SEC) / dsp.ENROLL_HOP_SEC) + 1} "
-          f"embeddings of {dsp.WINDOW_SEC}s each, the same length live.py uses.")
-    print("Vary your delivery across clips: normal, quiet, loud, laughing, "
-          "leaning in, leaning back. Uniform enrollment gives a brittle gate.")
+    print(f"""
+================================================================
+ENROLLMENT: teaching the filter what your voice looks like
+================================================================
+
+You will record two kinds of clip.
+
+  {args.clips} clips of YOU     These build your voiceprint. Only your voice
+                       can be on them. If anyone else talks during one,
+                       their voice gets averaged into your voiceprint and
+                       the filter partly learns to accept them too.
+
+  {args.impostors} clips of THEM   These are the counter-example. They tell the
+                       filter how close someone else gets to scoring like
+                       you, which is what sets the cutoff. You must be
+                       silent on these.
+
+Each {args.seconds:.0f}s clip is cut into {dsp.WINDOW_SEC}s windows, the same length the
+live filter looks at, and each window becomes one 192-number voiceprint.
+Windows that are less than {dsp.MIN_COVERAGE:.0%} speech are thrown away, so talk
+continuously. Long pauses are wasted recording time.
+
+Vary your delivery across your clips: normal, quiet, loud, laughing, leaning
+in, leaning back. A voiceprint built from eight identical clips only
+recognises you when you sound exactly like that.
+================================================================""")
 
     per_clip = []
     for i in range(args.clips):
-        wav = record(args.seconds, f"Clip {i+1}/{args.clips} - {args.name}",
-                     device=args.device)
+        wav = record(
+            args.seconds,
+            f"[YOU]  clip {i+1} of {args.clips}  --  {args.name} alone",
+            ["Only you. Nobody else in the room may speak, at any volume.",
+             "Talk continuously for the whole time: read something out loud,",
+             "describe your day, count. Do not pause for more than a second.",
+             f"Delivery for this one: {DELIVERY[i % len(DELIVERY)]}"],
+            device=args.device, channel=args.channel)
         embs, skipped = clip_embeddings(encoder, denoiser, wav)
         if len(embs) < MIN_WINDOWS_PER_CLIP:
             print(f"  skipping clip: only {len(embs)} usable windows, need "
@@ -252,10 +324,15 @@ def main():
     if args.impostors:
         others = []
         for i in range(args.impostors):
-            wav = record(args.seconds,
-                         f"Impostor {i+1}/{args.impostors} - someone else, "
-                         f"sitting where they normally sit",
-                         device=args.device)
+            wav = record(
+                args.seconds,
+                f"[THEM] impostor clip {i+1} of {args.impostors}",
+                ["The OTHER person talks. You stay completely silent.",
+                 "They sit where they normally sit, at their normal distance.",
+                 "Have them talk at a NORMAL to LOUD level, not quietly. The",
+                 "cutoff is calibrated against how loud they actually get, so",
+                 "a whispered impostor clip sets it too permissive."],
+                device=args.device, channel=args.channel)
             embs, _ = clip_embeddings(encoder, denoiser, wav)
             save_clip(args.clip_dir, "_impostors", i + 1, wav)
             others.append(embs)
