@@ -45,7 +45,8 @@ Its training conditions, read straight out of the checkpoint's model_args:
 
     sample_rate       8000        band-limited to 4 kHz, see the note below
     causal            False       needs the whole file, ~0 ms is not on offer
-    mask_act          relu        unbounded mask, output can exceed the input
+    mask_act          relu        unbounded mask; combined with SI-SDR training
+                                  the output level is arbitrary, see match_scale
     i_adapt_layer     7           speaker conditioning enters at TCN block 7
     adapt_enroll_dim  128         its own learned embedding, NOT ECAPA
 
@@ -340,6 +341,37 @@ def rms_normalize(x, target=TARGET_RMS):
     return (x * g).astype(np.float32), g
 
 
+def match_scale(est, ref):
+    """Put a scale-invariant estimate back on the reference's scale.
+
+    THIS IS NOT COSMETIC. TD-SpeakerBeam's output level is meaningless, and
+    ignoring that produces a silent listening test.
+
+    ConvTasNet-family models are trained with SI-SDR loss (scale-invariant
+    signal-to-distortion ratio), which deliberately does not penalize output
+    gain: an estimate 1000x too loud scores exactly the same as a perfect one.
+    Nothing in training ever pushes the output toward the input's scale, and
+    this checkpoint settled on roughly 350,000x. Its own bundled example does
+    the same thing, so it is a property of the model, not of our audio. The
+    upstream demo notebook divides by max() for this reason.
+
+    The scalar below is the least-squares fit: the value of a that minimizes
+    ||a*est - ref||. It puts the estimate at the level where it best explains
+    the mixture, which is the level the target speaker actually had in that
+    mixture. That is what makes "is the interferer quieter than before?" a
+    question you can answer by ear.
+
+    Peak normalization would also make the file audible, but it would not make
+    it comparable: it would set the level from whatever the single loudest
+    sample happened to be, so a click would rescale the whole comparison.
+    """
+    denom = float(np.dot(est, est))
+    if denom <= 1e-20:
+        return np.zeros_like(est)
+    a = float(np.dot(est, ref)) / denom
+    return (a * est).astype(np.float32)
+
+
 # --- extraction -----------------------------------------------------------
 
 def extract(model, mix, enroll, chunk_sec=CHUNK_SEC, overlap_sec=CHUNK_OVERLAP_SEC):
@@ -359,7 +391,13 @@ def extract(model, mix, enroll, chunk_sec=CHUNK_SEC, overlap_sec=CHUNK_OVERLAP_S
         with torch.no_grad():
             y = model(seg_t, enroll_t)
         # (batch, 1, time) for a 2D input. Squeeze back to 1D.
-        return y.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
+        y = y.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
+        # Per chunk, against that chunk's own mixture. Each chunk is a separate
+        # forward pass and the model is scale-invariant, so two chunks come back
+        # at unrelated levels. Crossfading those together would splice a step
+        # into the output. Matching here means the crossfade joins signals that
+        # are already on the same scale.
+        return match_scale(y, np.asarray(seg, dtype=np.float32))
 
     n = len(mix)
     if chunk_sec <= 0 or n <= int(chunk_sec * PROBE_SR):
@@ -457,6 +495,15 @@ def main(argv=None):
     p.add_argument("--dur", type=float, default=0.0, help="seconds to process, 0 for all")
     p.add_argument("--chunk-sec", type=float, default=CHUNK_SEC,
                    help="0 processes the whole file at once; needs more RAM")
+    p.add_argument("--control", default=None, metavar="DIR_OR_WAV",
+                   help="run a second pass conditioned on somebody else and "
+                        "report how much the two differ. Defaults to "
+                        "clips/_impostors when that exists. This is what "
+                        "separates 'the model ignored the enrollment' from "
+                        "'the model correctly passed a target that already "
+                        "dominated the mixture'.")
+    p.add_argument("--no-control", action="store_true",
+                   help="skip the control pass; roughly halves the runtime")
     p.add_argument("--device", default="cpu", help="cpu, or cuda if you have it")
     a = p.parse_args(argv)
 
@@ -509,7 +556,7 @@ def main(argv=None):
     model = load_speakerbeam(ckpt, device=a.device)
     print("extracting")
     est_n = extract(model, mix_n, enroll_n, chunk_sec=a.chunk_sec)
-    est = est_n / mix_gain
+    est = match_scale(est_n, mix_n) / mix_gain
 
     # One shared gain across every written file. Per-file peak normalization
     # would hide exactly what the probe is looking for: whether the interferer
@@ -532,9 +579,24 @@ def main(argv=None):
         sf.write(f, (resample_to(gated48, sr, PROBE_SR) * g).astype(np.float32), PROBE_SR)
         written.append(f)
 
+    # What the model took out. Amplified to its own peak because it is usually
+    # far below the mixture and the question is what it IS, not how loud.
+    # If this sounds like the interferer, the model is targeting the right
+    # voice even when the amount removed is small.
+    removed = mix - est
+    f = out_dir / f"{stem}_removed.wav"
+    pk = max(float(np.abs(removed).max()), 1e-9)
+    sf.write(f, (removed * (OUT_PEAK / pk)).astype(np.float32), PROBE_SR)
+    written.append(f)
+
     print("\nwrote:")
     for f in written:
         print(f"  {f}")
+    r_db = 20 * np.log10(
+        (np.sqrt(np.mean(removed ** 2)) + 1e-12) /
+        (np.sqrt(np.mean(mix ** 2)) + 1e-12))
+    print(f"\nextracted vs mixture: correlation "
+          f"{np.corrcoef(est, mix)[0, 1]:+.4f}, removed energy {r_db:+.1f} dB")
 
     if cents is not None:
         print("\nECAPA similarity (relative only, see score_against docstring):")
@@ -544,6 +606,38 @@ def main(argv=None):
         print(f"  {'speaker':<20} {'mixture':>8} {'extracted':>10} {'delta':>8}")
         for i, n in enumerate(names):
             print(f"  {n:<20} {s_mix[i]:8.3f} {s_est[i]:10.3f} {s_est[i] - s_mix[i]:+8.3f}")
+
+    # The control pass. A speaker-conditioned model handed a different speaker
+    # must produce a different answer. If it does not, the conditioning is
+    # inert and any apparent success is the model passing whoever was loudest.
+    control = a.control
+    if control is None and not a.no_control:
+        d = pathlib.Path(a.clip_dir) / "_impostors"
+        control = str(d) if any(d.glob("*.wav")) else None
+    if control and not a.no_control:
+        cp = pathlib.Path(control)
+        cpaths = sorted(cp.glob("*.wav")) if cp.is_dir() else [cp]
+        if cpaths:
+            print(f"\ncontrol pass, conditioned on {control} instead")
+            c_enroll, _ = read_enrollment(cpaths)
+            c_n, _ = rms_normalize(c_enroll)
+            c_est = match_scale(
+                extract(model, mix_n, c_n, chunk_sec=a.chunk_sec), mix_n) / mix_gain
+            f = out_dir / f"{stem}_control.wav"
+            sf.write(f, (c_est * g).astype(np.float32), PROBE_SR)
+            same = float(np.corrcoef(est, c_est)[0, 1])
+            print(f"  wrote {f}")
+            print(f"  target-conditioned vs control-conditioned: "
+                  f"correlation {same:+.4f}")
+            if same > 0.9:
+                print("  The two are nearly identical, so the enrollment is not "
+                      "changing the answer.\n  Whatever came out is the model "
+                      "passing the loudest voice, not extracting yours.")
+            else:
+                print("  The two differ, so the conditioning is doing real work. "
+                      "An extracted\n  output that resembles the mixture means "
+                      "your voice already dominated it,\n  not that the model "
+                      "ignored you.")
 
     print("\nListen to _extracted against _mix, not against the 48 kHz original.")
     print("Find a stretch where two people talk at once; that is the experiment.")

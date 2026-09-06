@@ -310,6 +310,7 @@ def run_guided(p, script):
     both would be writing the same terminal line with \r and the result is
     unreadable. Pipeline.monitor is forced off when this runs.
     """
+    t_entry = time.time()
     phases, t = [], 0.0
     for dur, label in script:
         phases.append((t, t + dur, label))
@@ -326,6 +327,10 @@ def run_guided(p, script):
         time.sleep(1.0)
 
     start = time.time()
+    # The stream is already recording while the plan prints and the count-in
+    # runs, so every phase sits this far into the file. Returned so the probe
+    # command we print afterwards points at the overlap and not before it.
+    lead_in = start - t_entry
     current = -1
     try:
         while True:
@@ -346,9 +351,9 @@ def run_guided(p, script):
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("\n  stopped early")
-        return time.time() - start
+        return lead_in
     print(f"\n\a  done")
-    return total
+    return lead_in
 
 
 def open_stream(inp, out, in_channel, out_channels, callback):
@@ -440,7 +445,7 @@ def main():
 
     with open_stream(args.inp, args.out, args.in_channel, out_channels, p.callback):
         if args.guide:
-            run_guided(p, PROBE_SCRIPT)
+            lead_in = run_guided(p, PROBE_SCRIPT)
         else:
             print("running - Ctrl+C to stop")
             try:
@@ -462,17 +467,20 @@ def main():
     if args.record_debug:
         print(f"\nwrote {args.record_debug}")
         if args.guide:
-            # Point the probe straight at the overlap. Skip the first few
-            # seconds of it, which are usually one person still finishing a
-            # sentence while the other starts.
+            print("\nWhere each phase landed in the file:")
             t = 0.0
+            both_at = None
             for dur, label in PROBE_SCRIPT:
-                if label.startswith("BOTH"):
-                    break
+                a, b = t + lead_in, t + dur + lead_in
+                print(f"    {mmss(a)} - {mmss(b)}   {label}")
+                if both_at is None and label.startswith("BOTH"):
+                    both_at = a
                 t += dur
-            print("Run the probe on the overlap:")
+            # Skip the first few seconds of the overlap: one person is usually
+            # still finishing a sentence while the other starts.
+            print("\nRun the probe on the overlap:")
             print(f"  python probe.py --debug-wav {args.record_debug} "
-                  f"--start {t + 5:.0f} --dur 30")
+                  f"--start {both_at + 5:.0f} --dur 30")
         else:
             print("Find a stretch where two people talk at once, then:")
             print(f"  python probe.py --debug-wav {args.record_debug} "
