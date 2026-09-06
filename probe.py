@@ -136,15 +136,16 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 import dsp
+import tse
 
 # --- tunables -------------------------------------------------------------
 
-# TD-SpeakerBeam's training rate. Not adjustable: the filterbank kernel size
-# (16 samples) and stride (8) are learned at this rate, so feeding it 16 kHz
-# would halve the effective analysis window and put the model well outside
-# anything it has seen. Band-limiting to 4 kHz is the cost of using released
-# weights, and it is a property of this checkpoint rather than of PSE.
-PROBE_SR = 8000
+# Both backends are 8 kHz, and it is not adjustable: their filterbanks are
+# learned at that rate, so feeding one 16 kHz audio would halve the effective
+# analysis window and put it well outside anything it has seen. Band-limiting
+# to 4 kHz is the cost of using released weights, and it is a property of these
+# checkpoints rather than of PSE.
+PROBE_SR = tse.SR
 
 # Whole-file inference on a ConvTasNet-shaped network allocates activations
 # proportional to clip length: roughly 512 channels x (samples / 8) frames x 24
@@ -173,90 +174,6 @@ MAX_ENROLL_SEC = 20.0
 # Peak level of the written files. Left below 1.0 so that a relu mask, which is
 # unbounded and can overshoot the mixture, does not clip on the way to disk.
 OUT_PEAK = 0.89
-
-SPEAKERBEAM_REPO = "https://github.com/BUTSpeechFIT/speakerbeam.git"
-SPEAKERBEAM_DIR = dsp.MODEL_DIR / "speakerbeam"
-
-
-# --- upstream checkout ----------------------------------------------------
-
-def ensure_speakerbeam(root=SPEAKERBEAM_DIR):
-    """Clone TD-SpeakerBeam into models/ and put its src/ on sys.path.
-
-    Cloned at runtime rather than vendored, for the licence reason in the module
-    docstring. models/ is gitignored, so nothing from upstream can be committed
-    here by accident.
-
-    The upstream modules import each other as `from models.base_models_informed
-    import ...`, with no package prefix, so src/ itself has to be the sys.path
-    entry. That collides with our own models/ directory name only on disk, not
-    in the import namespace, because we never import our models/ as a package.
-    """
-    root = pathlib.Path(root)
-    if not root.exists():
-        root.parent.mkdir(parents=True, exist_ok=True)
-        print(f"cloning TD-SpeakerBeam into {root} (about 30 MB)")
-        subprocess.run(
-            ["git", "clone", "--depth", "1", SPEAKERBEAM_REPO, str(root)],
-            check=True,
-        )
-
-    ckpt = root / "example" / "model.pth"
-    if not ckpt.exists():
-        raise FileNotFoundError(
-            f"{ckpt} is missing. The checkpoint lives in the upstream repo under "
-            f"example/. Delete {root} and re-run to fetch it again."
-        )
-
-    src = str((root / "src").resolve())
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    return ckpt
-
-
-def load_speakerbeam(ckpt_path, device="cpu"):
-    """Build TimeDomainSpeakerBeam and load the published weights.
-
-    Deliberately does NOT use asteroid's `Model.from_pretrained`, which is what
-    the upstream demo notebook calls. Two reasons, both of which are first-run
-    crashes on a current environment:
-
-      1. asteroid 0.7.0 calls `torch.load(path, map_location="cpu")` with no
-         `weights_only` argument. Since torch 2.6 that argument defaults to
-         True, and the load fails on anything the allowlist does not recognise.
-      2. It routes the path through `huggingface_hub.cached_download`, which
-         newer huggingface-hub releases removed entirely.
-
-    Doing the two steps by hand skips both. `weights_only=True` is tried first
-    and is expected to succeed: this checkpoint's pickle references only
-    OrderedDict, torch.FloatStorage and torch._utils._rebuild_tensor_v2, all of
-    which are on torch's allowlist. The fallback exists for other checkpoints.
-    """
-    import torch
-    from models.td_speakerbeam import TimeDomainSpeakerBeam
-
-    try:
-        conf = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    except Exception as e:
-        print(f"note: safe load failed ({type(e).__name__}), retrying unrestricted")
-        print("      only do this for checkpoints you trust the origin of")
-        conf = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-    for key in ("model_args", "state_dict"):
-        if key not in conf:
-            raise ValueError(f"checkpoint has no '{key}' key; got {list(conf)}")
-
-    model = TimeDomainSpeakerBeam(**conf["model_args"])
-    model.load_state_dict(conf["state_dict"])
-    model.eval().to(device)
-
-    sr = int(conf["model_args"].get("sample_rate", PROBE_SR))
-    if sr != PROBE_SR:
-        raise ValueError(
-            f"checkpoint sample_rate is {sr}, probe is built around {PROBE_SR}"
-        )
-    return model
-
 
 # --- audio helpers --------------------------------------------------------
 
@@ -520,6 +437,11 @@ def main(argv=None):
     p.add_argument("--dur", type=float, default=0.0, help="seconds to process, 0 for all")
     p.add_argument("--chunk-sec", type=float, default=CHUNK_SEC,
                    help="0 processes the whole file at once; needs more RAM")
+    p.add_argument("--backend", default="espnet", choices=sorted(tse.BACKENDS),
+                   help="which extraction model. 'espnet' is Apache-2.0 code "
+                        "with CC-BY-4.0 weights and can be shipped; "
+                        "'speakerbeam' is the original BUT release and is "
+                        "licensed for evaluation only.")
     p.add_argument("--control", default=None, metavar="DIR_OR_WAV",
                    help="run a second pass conditioned on somebody else and "
                         "report how much the two differ. Defaults to "
@@ -550,7 +472,6 @@ def main(argv=None):
     if names and speaker not in names:
         raise SystemExit(f"{speaker!r} is not enrolled in {a.speakers}: {names}")
 
-    ckpt = ensure_speakerbeam()
 
     raw48, gated48, sr = read_debug_wav(a.debug_wav)
     if sr != dsp.SR:
@@ -578,7 +499,7 @@ def main(argv=None):
     mix_n, mix_gain = rms_normalize(mix)
     enroll_n, _ = rms_normalize(enroll)
 
-    model = load_speakerbeam(ckpt, device=a.device)
+    model = tse.load(a.backend, device=a.device)
     print("extracting")
     est_n = extract(model, mix_n, enroll_n, chunk_sec=a.chunk_sec)
     est = match_scale(est_n, mix_n) / mix_gain
@@ -593,7 +514,7 @@ def main(argv=None):
 
     out_dir = pathlib.Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = pathlib.Path(a.debug_wav).stem
+    stem = f"{pathlib.Path(a.debug_wav).stem}_{a.backend}"
     written = []
     for tag, sig in (("mix", mix), ("extracted", est)):
         f = out_dir / f"{stem}_{tag}.wav"
@@ -661,10 +582,19 @@ def main(argv=None):
             print(f"  wrote {f}")
             print(f"  target-conditioned vs control-conditioned: "
                   f"correlation {same:+.4f}")
+            if same > 0.9:
+                print("  The two are nearly identical, so the enrollment is not "
+                      "changing the answer.\n  Whatever came out is the model "
+                      "passing the loudest voice, not extracting yours.")
+            else:
+                print("  The two differ, so the conditioning is doing real work.")
 
-            # The headline question. Comparing the interferer's score in the
-            # mixture against their score in the extraction answers "did THEIR
-            # voice get quieter", which no single-speaker number can.
+            # The headline question. Not "did the interferer get quieter" in
+            # absolute terms, because extraction shifts every speaker's score a
+            # little: a model that simply attenuates everything lowers both.
+            # What matters is whether it lowered THEM more than YOU, which is
+            # the difference between separating two voices and turning down the
+            # volume on both.
             if cents is not None:
                 enc2 = load_enc()
                 c_cent = centroid_from_clips(enc2, cpaths)
@@ -679,28 +609,36 @@ def main(argv=None):
                         rows[tag] = (a, b)
                         print(f"  {tag:<12}{a:>9.3f}{b:>9.3f}  "
                               f"{'target' if a > b else 'OTHER'}")
-                    duck = rows["extracted"][1] - rows["mix"][1]
-                    print(f"\n  interferer's score, mixture -> extracted: {duck:+.3f}")
-                    if duck < -0.05:
-                        print("  Their voice moved away from the output. That is "
-                              "ducking, which is the\n  result this probe exists "
-                              "to find.")
+                    d_them = rows["mix"][1] - rows["extracted"][1]
+                    d_you = rows["mix"][0] - rows["extracted"][0]
+                    print(f"\n  their score fell by {d_them:+.3f}, "
+                          f"yours by {d_you:+.3f}")
+                    if d_them > 0.01 and d_them > 2 * d_you:
+                        print(f"  Theirs fell {d_them / max(d_you, 1e-6):.1f}x "
+                              f"further than yours. That is separation: the "
+                              f"model is\n  removing them and keeping you.")
+                    elif d_them > 0.01 and d_them > d_you:
+                        print("  Theirs fell further than yours, so it is "
+                              "separating, but it is taking\n  some of you with "
+                              "them. Listen to _removed for how much.")
+                    elif d_them > 0.01:
+                        print("  Yours fell as far or further. It is attenuating "
+                              "both voices rather than\n  separating them, which "
+                              "is not what this is for.")
                     else:
                         print("  Their voice did not move away from the output. "
-                              "With the conditioning\n  proven to work by the "
-                              "correlation above, that means this recording did "
-                              "not\n  ask the model to do anything: record one "
-                              "where both voices are equally\n  loud before "
-                              "concluding either way.")
-            if same > 0.9:
-                print("  The two are nearly identical, so the enrollment is not "
-                      "changing the answer.\n  Whatever came out is the model "
-                      "passing the loudest voice, not extracting yours.")
-            else:
-                print("  The two differ, so the conditioning is doing real work. "
-                      "An extracted\n  output that resembles the mixture means "
-                      "your voice already dominated it,\n  not that the model "
-                      "ignored you.")
+                              "If the correlation above\n  shows the "
+                              "conditioning working, this recording did not ask "
+                              "the model to do\n  anything: record one where both "
+                              "voices are equally loud.")
+                    if rows["removed"][1] > rows["removed"][0]:
+                        print(f"  What it removed leans THEM "
+                              f"({rows['removed'][1]:.3f} vs "
+                              f"{rows['removed'][0]:.3f}), the right voice.")
+                    else:
+                        print(f"  What it removed leans YOU "
+                              f"({rows['removed'][0]:.3f} vs "
+                              f"{rows['removed'][1]:.3f}), the wrong voice.")
 
     print("\nListen to _extracted against _mix, not against the 48 kHz original.")
     print("Find a stretch where two people talk at once; that is the experiment.")

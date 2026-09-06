@@ -31,8 +31,13 @@ platformdirs==4.3.6
 # also requiring pytorch-lightning>=2.0.0. The pins below satisfy both. None of
 # it runs in the realtime path; probe.py only needs asteroid at import time,
 # because its lightning import is lazy inside serialize(), which we never call.
+# Backend "speakerbeam" (evaluation licence, probe only).
 asteroid==0.7.0
 asteroid-filterbanks==0.4.0
+# Backend "espnet" (Apache-2.0 code, CC-BY-4.0 weights, shippable). The ESPnet
+# modules themselves are fetched at runtime into models/, so this is the only
+# package it adds.
+torch-complex==0.4.4
 pytorch-lightning==2.0.9
 torchmetrics==0.11.4
 torchaudio==2.6.0        # must match torch above
