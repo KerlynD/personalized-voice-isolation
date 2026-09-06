@@ -15,7 +15,7 @@ when you are not the one talking. It does not separate voices: when somebody
 talks at the same time as you, the gate is open and both voices pass through.
 
 Handling that overlap needs a speaker-conditioned mask over the mixture, not a
-gate. `probe.py` tests whether a pretrained extraction model can do that on
+gate. `pvi.probe` tests whether a pretrained extraction model can do that on
 audio from your own room, offline, before anyone builds a realtime one.
 
 On the author's setup it can. With two people talking over each other at
@@ -26,7 +26,8 @@ non-causal, runs at 8 kHz, and is far slower than real time, so it is evidence
 that the approach transfers and not a working realtime filter. Run the probe on
 your own recordings rather than taking this on trust.
 
-Nothing else here has been benchmarked. There are no latency numbers.
+Component timings are in `docs/PLAN.md`. End-to-end latency has not been
+measured and there is no realtime mask estimator yet.
 
 ## Install
 
@@ -43,17 +44,17 @@ Model weights, about 120 MB in total, download on first use into `models/`.
 ## Use
 
 ```
-python enroll.py --list-devices
-python enroll.py --name <you> --device <mic> --clips 8 --impostors 4
+python -m pvi.enroll --list-devices
+python -m pvi.enroll --name <you> --device <mic> --clips 8 --impostors 4
 ```
 
 Enroll on the microphone and in the room you will actually use. This writes
 `speakers.npz` (centroids and a threshold) and `clips/<you>/*.wav` (reference
-recordings, which `probe.py` needs later).
+recordings, which `pvi.probe` needs later).
 
 ```
-python live.py --list-devices
-python live.py --in <mic> --out <cable> --monitor
+python -m pvi.live --list-devices
+python -m pvi.live --in <mic> --out <cable> --monitor
 ```
 
 `--monitor` prints the live similarity score. Watch it while you and someone
@@ -61,34 +62,45 @@ else take turns talking, and adjust `--threshold` until it separates you
 cleanly. The value enrollment suggests is a starting point, not a calibration.
 
 ```
-python live.py --in <mic> --out <cable> --record-debug session.wav
-python probe.py --debug-wav session.wav
+python -m pvi.live --in <mic> --out <cable> --record-debug session.wav
+python -m pvi.probe --debug-wav session.wav
 ```
 
 Record a couple of minutes including deliberate cross-talk, then probe it and
-listen to the files in `probe_out/`. `probe.py`'s docstring explains how to read
-the result:
+listen to the files in `probe_out/`. For how to read the result:
 
 ```
-python -c "import probe; print(probe.__doc__)"
+python -m pvi.probe --explain
 ```
 
-## Files
+## Layout
 
-| file | what it does |
-| --- | --- |
-| `dsp.py` | shared signal path: encoder, denoiser, resampling, scoring |
-| `enroll.py` | records reference clips, builds speaker centroids |
-| `live.py` | realtime loop: mic to denoise to gate to virtual output |
-| `probe.py` | offline test of a pretrained mask estimator on your recordings |
+Everything lives in the `pvi` package. The four runnable entry points are
+`python -m pvi.enroll`, `pvi.live`, `pvi.probe` and `pvi.bench`.
+
+```
+pvi/
+  dsp/        shared signal path: constants, resampling, embeddings, denoiser
+  enroll/     recording, clip analysis, threshold, speakers.npz
+  live/       ring buffer, realtime pipeline, devices, guided session
+  tse/        extraction backends and their licences
+  probe/      offline extraction test and its reporting
+  bench/      timing against the audio callback budget
+docs/PLAN.md            where this is going, phase by phase
+.claude/CLAUDE.md       invariants that must not be broken
+```
+
+Everything imports `pvi.dsp` and nothing reimplements any part of it. Enrollment
+and inference drifting apart is this project's classic silent bug: it raises
+nothing and quietly invalidates every threshold.
 
 `speakers.npz` holds enrollment centroids. They are biometric data, and they are
-gitignored. So are `models/` and every `.wav`.
+gitignored. So are `models/`, `clips/` and every `.wav`.
 
 ## Licence
 
 MIT, see LICENSE. This does not extend to model weights downloaded at runtime.
-TD-SpeakerBeam in particular, which `probe.py` fetches, ships under a BUT/NTT
+TD-SpeakerBeam in particular, which `pvi.probe` fetches, ships under a BUT/NTT
 evaluation-only licence: free to use internally for testing and evaluation, not
 redistributable and not modifiable. Running the probe is inside that grant.
 Shipping anything built on those weights is not.
