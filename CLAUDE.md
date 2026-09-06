@@ -36,6 +36,8 @@ or model fine-tuning. **Do not start either until the probe is run.**
 - `dsp.py` — shared signal path: encoder, denoiser, resampling, scoring
 - `enroll.py` — records reference clips, builds speaker centroids
 - `live.py` — realtime loop: mic -> denoise -> gate -> virtual output
+- `tse.py` — extraction backends for the probe, and their licences
+- `probe.py` — offline extraction test on real recordings
 
 The realtime harness (48 kHz capture, virtual device routing, non-blocking
 callback, ring buffer, resampling, enrollment, debug capture) is reusable as-is
