@@ -59,7 +59,7 @@ HANGOVER = 0.40       # hold the gate open this long after you stop
 EMA = 0.6             # smoothing on the similarity score
 FLOOR = 0.02          # closed-gate gain. Not zero: dead silence reads as a
                       # broken connection; -34 dB reads as "quiet room."
-VAD_RMS = 0.004       # below this, don't bother embedding
+VAD_RMS = 0.004       # below this the room is quiet; nobody is talking
 
 # Debug frames waiting to be written. At 512 samples per frame this is about
 # 2.7 seconds of slack, far more than a disk write ever needs. If it ever
@@ -106,7 +106,10 @@ class Ring:
 
 
 class Pipeline:
-    def __init__(self, names, centroids, threshold, monitor=False, debug=None):
+    def __init__(self, names, centroids, threshold, monitor=False, debug=None,
+                 in_channel=0, out_channels=(0,)):
+        self.in_channel = in_channel
+        self.out_channels = tuple(out_channels)
         self.names = names
         self.centroids = centroids
         self.threshold = threshold
@@ -123,6 +126,7 @@ class Pipeline:
         self.error = None
         self.short_blocks = 0
         self.debug_drops = 0
+        self.skipped_windows = 0
 
         # Precomputed so the callback does no arithmetic it can hoist. The
         # ramp traverses the full 0-to-1 gain range in RAMP_MS.
@@ -141,7 +145,7 @@ class Pipeline:
     def callback(self, indata, outdata, frames, t, status):
         if status:
             print(status, file=sys.stderr, flush=True)
-        raw = indata[:, 0].copy()
+        raw = indata[:, self.in_channel].copy()
 
         # process_frame demands exactly dsp.FRAME samples and raises otherwise,
         # and an exception in here tears down the stream. PortAudio should
@@ -151,7 +155,7 @@ class Pipeline:
         # better outcome than a dead microphone.
         if frames != dsp.FRAME:
             self.short_blocks += 1
-            outdata[:, 0] = raw * self.gain
+            self._emit(outdata, raw * self.gain)
             return
 
         clean = self.denoiser.process_frame(raw)
@@ -168,13 +172,24 @@ class Pipeline:
         )
         self.gain = float(ramp[-1])
         out = clean * ramp
-        outdata[:, 0] = out
+        self._emit(outdata, out)
 
         if self._debug_q is not None:
             try:
                 self._debug_q.put_nowait(np.stack([raw, out], axis=1))
             except queue.Full:
                 self.debug_drops += 1
+
+    def _emit(self, outdata, signal):
+        """Write the mono result to the chosen output channels, silence the rest.
+
+        Everything not written has to be zeroed explicitly: PortAudio hands us
+        an uninitialised buffer, so an untouched channel plays whatever was in
+        that memory, which is either the previous block or noise.
+        """
+        outdata[:] = 0.0
+        for c in self.out_channels:
+            outdata[:, c] = signal
 
     # ---------------- debug writer thread ----------------
     def _write_debug(self):
@@ -221,6 +236,21 @@ class Pipeline:
             self._maybe_close()
             return
 
+        # A window can clear the loudness check and still be mostly silence:
+        # the one that straddles the moment you start talking is maybe 30%
+        # speech, and ECAPA returns something closer to a fingerprint of the
+        # room than of you. Embedding it produces a low score that the EMA then
+        # carries for several windows, which is what clips your first word.
+        #
+        # Skip the decision rather than make a bad one. Do NOT close the gate
+        # here: this is a transition, not silence, and silence is already
+        # handled above. Whatever the gate was doing, it keeps doing until a
+        # window arrives that is actually worth judging, about 750 ms after
+        # speech onset at the default window and hop.
+        if dsp.speech_coverage(win) < dsp.MIN_COVERAGE:
+            self.skipped_windows += 1
+            return
+
         e = dsp.embed(self.encoder, dsp.to_analysis(win))
         sim, i = dsp.best_score(self.centroids, e)
         self.score = EMA * self.score + (1 - EMA) * sim
@@ -255,17 +285,25 @@ class Pipeline:
             self._debug_thread.join(timeout=5.0)
 
 
-def open_stream(inp, out, callback):
+def open_stream(inp, out, in_channel, out_channels, callback):
     """Open the duplex stream, with a readable failure for the common macOS case.
 
     A duplex sd.Stream spans one input device and one output device. When those
     are two different physical devices they run on two different clocks, and
     CoreAudio will not bridge them for us. The fix is an Aggregate Device, which
     makes the OS do the bridging before PortAudio ever sees it.
+
+    An aggregate device stacks its members' channels end to end, so on a typical
+    "microphone plus virtual cable" aggregate the cable is NOT channel 0. We
+    cannot ask PortAudio for channel 5 without opening channels 0 through 5, so
+    open enough channels to reach the highest one we need and let _emit zero the
+    rest.
     """
     try:
         return sd.Stream(device=(inp, out), samplerate=dsp.SR,
-                         blocksize=dsp.FRAME, channels=1, dtype="float32",
+                         blocksize=dsp.FRAME,
+                         channels=(in_channel + 1, max(out_channels) + 1),
+                         dtype="float32",
                          latency="low", callback=callback)
     except Exception as e:
         raise SystemExit(
@@ -283,6 +321,14 @@ def main():
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--in", dest="inp", type=int, help="input device (AT2020)")
     ap.add_argument("--out", dest="out", type=int, help="output device (virtual cable)")
+    ap.add_argument("--in-channel", type=int, default=0, metavar="N",
+                    help="which input channel carries the mic, counting from 0. "
+                         "On an Aggregate Device the members stack end to end, so "
+                         "this is 0 only if the mic is the first member.")
+    ap.add_argument("--out-channel", default="0", metavar="N[,N]",
+                    help="which output channel(s) to send to, counting from 0. "
+                         "Give both channels of a stereo virtual cable, e.g. 2,3, "
+                         "or Discord hears you in one ear.")
     ap.add_argument("--speakers", default="speakers.npz")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--monitor", action="store_true",
@@ -300,17 +346,28 @@ def main():
 
     dsp.limit_torch_threads()
 
+    try:
+        out_channels = tuple(int(c) for c in args.out_channel.split(","))
+    except ValueError:
+        ap.error(f"--out-channel must be numbers separated by commas, "
+                 f"got {args.out_channel!r}")
+
     d = np.load(args.speakers, allow_pickle=False)
     names = [str(n) for n in d["names"]]
     centroids = d["centroids"]
     threshold = args.threshold if args.threshold is not None else float(d["threshold"])
     print(f"enrolled: {names}  threshold={threshold:.3f}")
 
+    print(f"input:  device {args.inp} channel {args.in_channel}")
+    print(f"output: device {args.out} channel(s) "
+          f"{','.join(str(c) for c in out_channels)}")
+
     p = Pipeline(names, centroids, threshold,
-                 monitor=args.monitor, debug=args.record_debug)
+                 monitor=args.monitor, debug=args.record_debug,
+                 in_channel=args.in_channel, out_channels=out_channels)
     threading.Thread(target=p.analyze, daemon=True).start()
 
-    with open_stream(args.inp, args.out, p.callback):
+    with open_stream(args.inp, args.out, args.in_channel, out_channels, p.callback):
         print("running - Ctrl+C to stop")
         try:
             while True:
@@ -321,6 +378,8 @@ def main():
     # the debug writer can drain what is left without racing new frames in.
     p.close()
 
+    if p.skipped_windows:
+        print(f"\n{p.skipped_windows} windows skipped as mostly silence")
     if p.short_blocks:
         print(f"\n{p.short_blocks} blocks arrived at the wrong size and bypassed "
               f"the denoiser")
