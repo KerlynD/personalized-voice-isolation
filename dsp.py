@@ -47,6 +47,26 @@ WINDOW_SEC = 1.5
 # count suggests).
 ENROLL_HOP_SEC = 0.5
 
+# A window has to be mostly speech before it is worth embedding. Measured on
+# real enrollment audio: overall window loudness barely predicts embedding
+# quality (r = +0.05), but the fraction of the window that is actually speech
+# predicts it far better (r = +0.36). A window that is 70% room tone still
+# clears a plain loudness check, and ECAPA returns a fingerprint of nothing in
+# particular for it. Those windows were the three worst in a real enrollment.
+#
+# Lower this and transitional windows (silence, then you start talking) leak in
+# and pollute both the centroid and the runtime score. Raise it and you throw
+# away usable audio and react more slowly to speech onset.
+MIN_COVERAGE = 0.5
+
+# A 20 ms frame counts as active if it is audible in absolute terms AND within
+# 20 dB of the loudest frame in its window. The relative half is what makes
+# this work across mic gains: a quiet talker's speech is still 20 dB above
+# their own room tone.
+COVERAGE_FRAME = 960          # 20 ms at 48 kHz
+COVERAGE_FLOOR_DB = 20.0
+COVERAGE_ABS_RMS = 0.004      # same absolute floor live.py uses as its VAD
+
 # ONNX Runtime thread pool size for the denoiser. One, not the default of
 # "all cores": at 512 samples per frame the pool's synchronization costs more
 # than the inference it parallelizes, and the extra threads compete with the
@@ -113,6 +133,30 @@ def analysis_windows(wav48, window_sec=WINDOW_SEC, hop_sec=ENROLL_HOP_SEC):
     hop = int(hop_sec * SR)
     for start in range(0, max(0, len(wav48) - win + 1), hop):
         yield wav48[start:start + win]
+
+
+def speech_coverage(wav48):
+    """Fraction of a window that is actually speech, 0.0 to 1.0.
+
+    Cheap: frame energies and two comparisons, no model. Call it before paying
+    for an embedding. See MIN_COVERAGE for why loudness alone is not enough.
+
+    Used identically by enroll.py (to reject windows before they reach the
+    centroid) and live.py (to skip a decision rather than make a bad one). That
+    shared use is the point: a window that enrollment would have thrown away
+    must not be one the runtime happily embeds, or the two ends of the pipeline
+    disagree about what counts as speech.
+    """
+    n = len(wav48) // COVERAGE_FRAME
+    if n == 0:
+        return 0.0
+    frames = wav48[:n * COVERAGE_FRAME].reshape(n, COVERAGE_FRAME)
+    e = np.sqrt((frames ** 2).mean(axis=1))
+    peak = e.max()
+    if peak <= 0.0:
+        return 0.0
+    rel = peak * (10.0 ** (-COVERAGE_FLOOR_DB / 20.0))
+    return float(((e > rel) & (e > COVERAGE_ABS_RMS)).mean())
 
 
 class Denoiser:

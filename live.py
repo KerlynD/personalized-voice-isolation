@@ -59,7 +59,7 @@ HANGOVER = 0.40       # hold the gate open this long after you stop
 EMA = 0.6             # smoothing on the similarity score
 FLOOR = 0.02          # closed-gate gain. Not zero: dead silence reads as a
                       # broken connection; -34 dB reads as "quiet room."
-VAD_RMS = 0.004       # below this, don't bother embedding
+VAD_RMS = 0.004       # below this the room is quiet; nobody is talking
 
 # Debug frames waiting to be written. At 512 samples per frame this is about
 # 2.7 seconds of slack, far more than a disk write ever needs. If it ever
@@ -123,6 +123,7 @@ class Pipeline:
         self.error = None
         self.short_blocks = 0
         self.debug_drops = 0
+        self.skipped_windows = 0
 
         # Precomputed so the callback does no arithmetic it can hoist. The
         # ramp traverses the full 0-to-1 gain range in RAMP_MS.
@@ -219,6 +220,21 @@ class Pipeline:
 
         if float(np.sqrt(np.mean(win**2))) < VAD_RMS:
             self._maybe_close()
+            return
+
+        # A window can clear the loudness check and still be mostly silence:
+        # the one that straddles the moment you start talking is maybe 30%
+        # speech, and ECAPA returns something closer to a fingerprint of the
+        # room than of you. Embedding it produces a low score that the EMA then
+        # carries for several windows, which is what clips your first word.
+        #
+        # Skip the decision rather than make a bad one. Do NOT close the gate
+        # here: this is a transition, not silence, and silence is already
+        # handled above. Whatever the gate was doing, it keeps doing until a
+        # window arrives that is actually worth judging, about 750 ms after
+        # speech onset at the default window and hop.
+        if dsp.speech_coverage(win) < dsp.MIN_COVERAGE:
+            self.skipped_windows += 1
             return
 
         e = dsp.embed(self.encoder, dsp.to_analysis(win))
@@ -321,6 +337,8 @@ def main():
     # the debug writer can drain what is left without racing new frames in.
     p.close()
 
+    if p.skipped_windows:
+        print(f"\n{p.skipped_windows} windows skipped as mostly silence")
     if p.short_blocks:
         print(f"\n{p.short_blocks} blocks arrived at the wrong size and bypassed "
               f"the denoiser")

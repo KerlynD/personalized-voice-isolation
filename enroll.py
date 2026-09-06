@@ -53,6 +53,17 @@ import soundfile as sf
 
 import dsp
 
+# Which percentile of each distribution counts as its edge. NOT the min and max:
+# taking the single worst of ~80 enrollment windows lets one bad window set your
+# operating point, and on a real enrollment that one window (the opening of the
+# first clip, mostly room tone) dragged the floor from 0.33 down to 0.10 and
+# turned a workable +0.12 margin into an unusable -0.11. Percentiles say "ignore
+# the worst 5% of my own windows and the best 5% of theirs", which is the right
+# question, because the gate does not have to be right on every single window.
+# The score live.py compares is smoothed by EMA across several windows anyway.
+SELF_PERCENTILE = 5
+IMPOSTOR_PERCENTILE = 95
+
 # Where the threshold sits between the impostor ceiling and your own floor.
 # 0.0 puts it right at the loudest impostor score, which leaks constantly.
 # 1.0 puts it at your own worst window, which cuts you off constantly.
@@ -91,23 +102,41 @@ def record(seconds, prompt, device=None):
 def clip_embeddings(encoder, denoiser, wav48):
     """The one true preprocessing path, must match live.py exactly.
 
-    Returns one embedding per dsp.WINDOW_SEC window, shape (n_windows, EMB_DIM).
-    Denoising happens on the whole clip before windowing, which is what live.py
-    effectively does too: it denoises continuously and windows the result.
+    Returns one embedding per usable dsp.WINDOW_SEC window, shape
+    (n_windows, EMB_DIM), plus how many windows were skipped. Denoising happens
+    on the whole clip before windowing, which is what live.py effectively does
+    too: it denoises continuously and windows the result.
+
+    Windows that are mostly silence are dropped rather than embedded. They
+    happen at the start of a clip, before you begin talking, and in the gaps
+    between sentences. Their embeddings are not "you speaking quietly", they
+    are noise, and averaging them into the centroid moves it toward the room
+    rather than toward your voice. live.py applies the same test at runtime.
     """
     clean48 = denoiser.process(wav48)
-    embs = [dsp.embed(encoder, dsp.to_analysis(w))
-            for w in dsp.analysis_windows(clean48)]
+    embs, skipped = [], 0
+    for w in dsp.analysis_windows(clean48):
+        if dsp.speech_coverage(w) < dsp.MIN_COVERAGE:
+            skipped += 1
+            continue
+        embs.append(dsp.embed(encoder, dsp.to_analysis(w)))
     if not embs:
         raise ValueError(
-            f"clip is shorter than one {dsp.WINDOW_SEC}s window after denoising; "
-            f"record with --seconds at least {dsp.WINDOW_SEC + 1:.0f}"
+            f"no window in this clip was at least {dsp.MIN_COVERAGE:.0%} speech. "
+            f"Either the clip is shorter than {dsp.WINDOW_SEC}s, or you were not "
+            f"talking for most of it. Talk continuously through the whole clip."
         )
-    return np.stack(embs)
+    return np.stack(embs), skipped
 
 
 def save_clip(clip_dir, name, index, wav48):
-    """Write the raw recording for probe.py to use as an enrollment reference."""
+    """Write the raw recording to clips/<name>/.
+
+    For the enrolled speaker these are probe.py's reference clips. Impostor
+    clips go to clips/_impostors/ and are saved for a different reason: without
+    them you cannot re-derive a threshold, re-check a margin, or diagnose a bad
+    enrollment without dragging the other person back to the microphone.
+    """
     d = pathlib.Path(clip_dir) / name
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{name}_{index:02d}.wav"
@@ -137,7 +166,10 @@ def leave_one_clip_out_sims(per_clip):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--name", required=True, help="label for this speaker")
+    # Not required=True: argparse enforces that before we get a chance to
+    # handle --list-devices, so `enroll.py --list-devices` would error out
+    # asking for a name you cannot know yet.
+    ap.add_argument("--name", help="label for this speaker")
     ap.add_argument("--clips", type=int, default=8)
     ap.add_argument("--seconds", type=float, default=6.0)
     ap.add_argument("--impostors", type=int, default=0,
@@ -155,6 +187,8 @@ def main():
     if args.list_devices:
         print(sd.query_devices())
         return
+    if not args.name:
+        ap.error("--name is required (or use --list-devices)")
 
     if args.device is None:
         # Enrolling on one microphone and running on another is the single
@@ -182,13 +216,14 @@ def main():
     for i in range(args.clips):
         wav = record(args.seconds, f"Clip {i+1}/{args.clips} - {args.name}",
                      device=args.device)
-        embs = clip_embeddings(encoder, denoiser, wav)
+        embs, skipped = clip_embeddings(encoder, denoiser, wav)
         if len(embs) < MIN_WINDOWS_PER_CLIP:
-            print(f"  skipping: only {len(embs)} windows, need "
-                  f"{MIN_WINDOWS_PER_CLIP}")
+            print(f"  skipping clip: only {len(embs)} usable windows, need "
+                  f"{MIN_WINDOWS_PER_CLIP}. Talk for the whole {args.seconds:.0f}s.")
             continue
         path = save_clip(args.clip_dir, args.name, i + 1, wav)
-        print(f"  {len(embs)} windows, saved {path}")
+        note = f", {skipped} mostly silent" if skipped else ""
+        print(f"  {len(embs)} windows{note}, saved {path}")
         per_clip.append(embs)
 
     if len(per_clip) < 2:
@@ -199,12 +234,19 @@ def main():
     centroid /= np.linalg.norm(centroid)
 
     self_sims = leave_one_clip_out_sims(per_clip)
-    print(f"\n{len(mine)} windows from {len(per_clip)} clips")
-    print(f"Self-similarity (held out): min={self_sims.min():.3f} "
-          f"mean={self_sims.mean():.3f}")
-    if self_sims.min() < 0.55:
-        print("  One clip is an outlier, probably clipped, silent, or noisy. "
-              "Consider re-recording.")
+    print(f"\n{len(mine)} usable windows from {len(per_clip)} clips")
+    print(f"Self-similarity (held out): p{SELF_PERCENTILE}="
+          f"{np.percentile(self_sims, SELF_PERCENTILE):.3f} "
+          f"min={self_sims.min():.3f} mean={self_sims.mean():.3f}")
+    # Reported per clip because a single low clip is actionable (re-record it)
+    # while a uniformly low spread is not (it means the mic or room is the
+    # problem, or that ECAPA cannot pin your voice down in this environment).
+    for i, embs in enumerate(per_clip):
+        rest = np.concatenate(per_clip[:i] + per_clip[i + 1:])
+        c = rest.mean(0); c /= np.linalg.norm(c) + 1e-9
+        m = float((embs @ c).mean())
+        flag = "   <-- unlike your other clips" if m < 0.45 else ""
+        print(f"    clip {i+1}: mean={m:+.3f}{flag}")
 
     threshold = DEFAULT_THRESHOLD
     if args.impostors:
@@ -214,20 +256,27 @@ def main():
                          f"Impostor {i+1}/{args.impostors} - someone else, "
                          f"sitting where they normally sit",
                          device=args.device)
-            others.append(clip_embeddings(encoder, denoiser, wav))
+            embs, _ = clip_embeddings(encoder, denoiser, wav)
+            save_clip(args.clip_dir, "_impostors", i + 1, wav)
+            others.append(embs)
         other_sims = np.concatenate(others) @ centroid
-        print(f"Impostor similarity: max={other_sims.max():.3f} "
-              f"mean={other_sims.mean():.3f}")
+        hi = float(np.percentile(self_sims, SELF_PERCENTILE))
+        lo = float(np.percentile(other_sims, IMPOSTOR_PERCENTILE))
+        print(f"Impostor similarity: p{IMPOSTOR_PERCENTILE}={lo:.3f} "
+              f"max={other_sims.max():.3f} mean={other_sims.mean():.3f}")
 
-        lo, hi = float(other_sims.max()), float(self_sims.min())
         threshold = lo + THRESHOLD_BIAS * (hi - lo)
         margin = hi - lo
-        print(f"Separation margin: {margin:+.3f}")
+        print(f"Separation margin: {margin:+.3f}  "
+              f"(your p{SELF_PERCENTILE}={hi:.3f} vs their "
+              f"p{IMPOSTOR_PERCENTILE}={lo:.3f})")
         print(f"Threshold placed {THRESHOLD_BIAS:.0%} of the way from the "
               f"impostor ceiling toward your floor")
         if margin <= 0:
-            print("  Distributions overlap, the gate will make errors. More "
-                  "and longer enrollment clips usually fixes this.")
+            print("  Distributions overlap, the gate will make errors. Usually "
+                  "this means the impostor clips were recorded much quieter "
+                  "than yours, or your own clips vary more than the two voices "
+                  "differ. More and longer clips of both usually fixes it.")
 
     names, centroids = [], []
     if args.add and os.path.exists(args.out):
