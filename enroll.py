@@ -82,6 +82,28 @@ DEFAULT_THRESHOLD = 0.35
 # this you are averaging almost the same window with itself.
 MIN_WINDOWS_PER_CLIP = 3
 
+# How much a clip's own windows must agree with each other. This separates the
+# two ways a clip can be unusual, which need opposite responses:
+#
+#   coherent but far from the others  you talked differently on that clip.
+#                                     Keep it. It widens the voiceprint.
+#   incoherent                        the windows disagree among themselves,
+#                                     because some caught a second voice and
+#                                     some did not. Delete it. It drags the
+#                                     voiceprint toward whoever else was there.
+#
+# Measured on real enrollments: clean clips sit at 0.78 to 0.81 regardless of
+# how loud or quiet the delivery was, and a clip with someone audible in the
+# background came in at 0.71 while scoring 0.19 against the rest.
+#
+# Coherence alone does not condemn a clip. It only explains one that is ALREADY
+# far from the others, which is what EXTERNAL_MIN decides. A clip can have
+# scattered windows and still sit right on top of your voiceprint, and that is
+# just you being variable within one take; dropping it measurably hurt the
+# floor on real data.
+COHERENCE_MIN = 0.75
+EXTERNAL_MIN = 0.45
+
 # Cycled through the target's clips so the voiceprint covers a range of
 # deliveries rather than eight takes of the same sentence at the same volume.
 DELIVERY = [
@@ -124,7 +146,8 @@ def clip_embeddings(encoder, denoiser, wav48):
     """The one true preprocessing path, must match live.py exactly.
 
     Returns one embedding per usable dsp.WINDOW_SEC window, shape
-    (n_windows, EMB_DIM), plus how many windows were skipped. Denoising happens
+    (n_windows, EMB_DIM), plus the coverage of every window whether it was
+    kept or not, so the caller can explain a rejection. Denoising happens
     on the whole clip before windowing, which is what live.py effectively does
     too: it denoises continuously and windows the result.
 
@@ -135,19 +158,18 @@ def clip_embeddings(encoder, denoiser, wav48):
     rather than toward your voice. live.py applies the same test at runtime.
     """
     clean48 = denoiser.process(wav48)
-    embs, skipped = [], 0
+    embs, covs = [], []
     for w in dsp.analysis_windows(clean48):
-        if dsp.speech_coverage(w) < dsp.MIN_COVERAGE:
-            skipped += 1
+        c = dsp.speech_coverage(w)
+        covs.append(c)
+        if c < dsp.MIN_COVERAGE:
             continue
         embs.append(dsp.embed(encoder, dsp.to_analysis(w)))
-    if not embs:
-        raise ValueError(
-            f"no window in this clip was at least {dsp.MIN_COVERAGE:.0%} speech. "
-            f"Either the clip is shorter than {dsp.WINDOW_SEC}s, or you were not "
-            f"talking for most of it. Talk continuously through the whole clip."
-        )
-    return np.stack(embs), skipped
+    # Returns an empty array rather than raising. A clip that yields nothing is
+    # a recording problem, not a program error, and the caller is in a better
+    # position to offer a retry than an exception is to end the session.
+    out = np.stack(embs) if embs else np.zeros((0, dsp.EMB_DIM), np.float32)
+    return out, covs
 
 
 def save_clip(clip_dir, name, index, wav48):
@@ -163,6 +185,69 @@ def save_clip(clip_dir, name, index, wav48):
     path = d / f"{name}_{index:02d}.wav"
     sf.write(path, wav48, dsp.SR)
     return path
+
+
+def record_usable(encoder, denoiser, seconds, header, instructions,
+                  device, channel, min_windows):
+    """Record until the clip is usable, or the user chooses to skip or stop.
+
+    Losing eight good recordings because the ninth was too quiet is not an
+    acceptable failure. Nothing here is expensive to redo, so ask.
+
+    Returns (wav, embeddings) or (None, None) if the clip was skipped.
+    """
+    while True:
+        wav = record(seconds, header, instructions, device=device, channel=channel)
+        embs, covs = clip_embeddings(encoder, denoiser, wav)
+        skipped = len(covs) - len(embs)
+        if len(embs) >= min_windows:
+            note = f", {skipped} mostly silent" if skipped else ""
+            print(f"  {len(embs)} usable windows{note}")
+            return wav, embs
+
+        best = max(covs) if covs else 0.0
+        print(f"  NOT USABLE: only {len(embs)} of {len(covs)} windows were at "
+              f"least {dsp.MIN_COVERAGE:.0%} speech (need {min_windows}).")
+        print(f"  The best window was {best:.0%} speech.")
+        if best < 0.2:
+            print("  That is close to silence. Check that the right microphone "
+                  "is selected and that whoever is talking is actually audible.")
+        else:
+            print("  Talk continuously for the whole clip, without long pauses, "
+                  "and a little louder or closer to the mic.")
+        ans = input("  [Enter] to re-record, 's' to skip this clip, "
+                    "'a' to abort > ").strip().lower()
+        if ans.startswith("s"):
+            return None, None
+        if ans.startswith("a"):
+            raise SystemExit("aborted; clips already recorded are still on disk")
+
+
+def load_saved_clips(encoder, denoiser, clip_dir, name, min_windows):
+    """Rebuild embeddings from clips a previous run already recorded.
+
+    The clips are the raw audio, so re-deriving embeddings from them is exactly
+    equivalent to having just recorded them. This is what makes a failed
+    enrollment resumable instead of a total loss.
+    """
+    paths = sorted((pathlib.Path(clip_dir) / name).glob("*.wav"))
+    if not paths:
+        raise SystemExit(f"no saved clips in {clip_dir}/{name}/ to reuse")
+    per_clip, kept = [], []
+    for path in paths:
+        wav, sr = sf.read(path, dtype="float32")
+        if sr != dsp.SR:
+            raise SystemExit(f"{path} is {sr} Hz, expected {dsp.SR}")
+        embs, covs = clip_embeddings(encoder, denoiser, np.ascontiguousarray(wav))
+        if len(embs) < min_windows:
+            print(f"  {path.name}: only {len(embs)} usable windows, skipping")
+            continue
+        skipped = len(covs) - len(embs)
+        note = f", {skipped} mostly silent" if skipped else ""
+        print(f"  {path.name}: {len(embs)} usable windows{note}")
+        per_clip.append(embs)
+        kept.append(path)
+    return per_clip, kept
 
 
 def leave_one_clip_out_sims(per_clip):
@@ -202,6 +287,10 @@ def main():
                          "Must match live.py --in-channel, or you enroll on one "
                          "microphone and run on another.")
     ap.add_argument("--list-devices", action="store_true")
+    ap.add_argument("--from-clips", action="store_true",
+                    help="reuse the clips a previous run already saved instead "
+                         "of recording new ones. Use this to resume after a "
+                         "failed enrollment without re-recording everything.")
     ap.add_argument("--add", action="store_true",
                     help="append to an existing enrollment instead of replacing")
     ap.add_argument("--out", default="speakers.npz")
@@ -215,7 +304,10 @@ def main():
     if not args.name:
         ap.error("--name is required (or use --list-devices)")
 
-    if args.device is None:
+    if args.device is None and not args.from_clips:
+        # Only when we are about to record. --from-clips reads audio off disk,
+        # so there is no device to get wrong and nothing to warn about.
+        #
         # Enrolling on one microphone and running on another is the single
         # easiest way to get a gate that never opens, and nothing about it
         # looks like an error. Say which device is about to be used.
@@ -233,7 +325,7 @@ def main():
     # from a previous run would silently become part of the probe's reference
     # audio, which is exactly the kind of stale-data bug that looks like a bad
     # model result.
-    if not args.add:
+    if not args.add and not args.from_clips:
         stale = sorted((pathlib.Path(args.clip_dir) / args.name).glob("*.wav"))
         stale += sorted((pathlib.Path(args.clip_dir) / "_impostors").glob("*.wav"))
         if stale:
@@ -278,25 +370,27 @@ in, leaning back. A voiceprint built from eight identical clips only
 recognises you when you sound exactly like that.
 ================================================================""")
 
-    per_clip = []
-    for i in range(args.clips):
-        wav = record(
-            args.seconds,
-            f"[YOU]  clip {i+1} of {args.clips}  --  {args.name} alone",
-            ["Only you. Nobody else in the room may speak, at any volume.",
-             "Talk continuously for the whole time: read something out loud,",
-             "describe your day, count. Do not pause for more than a second.",
-             f"Delivery for this one: {DELIVERY[i % len(DELIVERY)]}"],
-            device=args.device, channel=args.channel)
-        embs, skipped = clip_embeddings(encoder, denoiser, wav)
-        if len(embs) < MIN_WINDOWS_PER_CLIP:
-            print(f"  skipping clip: only {len(embs)} usable windows, need "
-                  f"{MIN_WINDOWS_PER_CLIP}. Talk for the whole {args.seconds:.0f}s.")
-            continue
-        path = save_clip(args.clip_dir, args.name, i + 1, wav)
-        note = f", {skipped} mostly silent" if skipped else ""
-        print(f"  {len(embs)} windows{note}, saved {path}")
-        per_clip.append(embs)
+    if args.from_clips:
+        print(f"\nReusing clips already recorded in {args.clip_dir}/{args.name}/")
+        per_clip, clip_paths = load_saved_clips(encoder, denoiser, args.clip_dir,
+                                               args.name, MIN_WINDOWS_PER_CLIP)
+    else:
+        per_clip, clip_paths = [], []
+        for i in range(args.clips):
+            wav, embs = record_usable(
+                encoder, denoiser, args.seconds,
+                f"[YOU]  clip {i+1} of {args.clips}  --  {args.name} alone",
+                ["Only you. Nobody else in the room may speak, at any volume.",
+                 "Talk continuously for the whole time: read something out loud,",
+                 "describe your day, count. Do not pause for more than a second.",
+                 f"Delivery for this one: {DELIVERY[i % len(DELIVERY)]}"],
+                args.device, args.channel, MIN_WINDOWS_PER_CLIP)
+            if wav is None:
+                continue
+            path = save_clip(args.clip_dir, args.name, i + 1, wav)
+            print(f"  saved {path}")
+            per_clip.append(embs)
+            clip_paths.append(path)
 
     if len(per_clip) < 2:
         raise SystemExit("need at least 2 usable clips to enroll")
@@ -310,33 +404,64 @@ recognises you when you sound exactly like that.
     print(f"Self-similarity (held out): p{SELF_PERCENTILE}="
           f"{np.percentile(self_sims, SELF_PERCENTILE):.3f} "
           f"min={self_sims.min():.3f} mean={self_sims.mean():.3f}")
-    # Reported per clip because a single low clip is actionable (re-record it)
-    # while a uniformly low spread is not (it means the mic or room is the
-    # problem, or that ECAPA cannot pin your voice down in this environment).
+    # Reported per clip because a single bad clip is actionable (delete it)
+    # while a uniformly low spread is not (that means the microphone or the
+    # room is the problem, not any one recording). See COHERENCE_MIN for why
+    # both numbers are needed to tell those apart.
+    print(f"    {'clip':<26}{'coherence':>10}{'vs others':>11}")
+    suspect = []
     for i, embs in enumerate(per_clip):
+        own = embs.mean(0); own /= np.linalg.norm(own) + 1e-9
+        internal = float((embs @ own).mean())
         rest = np.concatenate(per_clip[:i] + per_clip[i + 1:])
         c = rest.mean(0); c /= np.linalg.norm(c) + 1e-9
-        m = float((embs @ c).mean())
-        flag = "   <-- unlike your other clips" if m < 0.45 else ""
-        print(f"    clip {i+1}: mean={m:+.3f}{flag}")
+        external = float((embs @ c).mean())
+        if external >= EXTERNAL_MIN:
+            flag = ""                       # agrees with the rest, nothing to say
+        elif internal < COHERENCE_MIN:
+            flag = "  <-- another voice or noise on this clip"
+            suspect.append(clip_paths[i])
+        else:
+            flag = "  <-- unusual delivery, but consistent. Keeping it is fine."
+        name = clip_paths[i].name if i < len(clip_paths) else f"clip {i+1}"
+        print(f"    {name:<26}{internal:>10.3f}{external:>11.3f}{flag}")
+
+    if suspect:
+        print("\n  Those clips have windows that disagree with each other, which "
+              "usually\n  means somebody else was audible. To drop them and "
+              "rebuild without\n  re-recording anything else:\n")
+        for f in suspect:
+            print(f"      rm {f}")
+        print(f"      python enroll.py --name {args.name} --from-clips "
+              f"--device {args.device} --channel {args.channel} "
+              f"--impostors {args.impostors}\n")
 
     threshold = DEFAULT_THRESHOLD
+    other_sims = None
     if args.impostors:
         others = []
         for i in range(args.impostors):
-            wav = record(
-                args.seconds,
+            wav, embs = record_usable(
+                encoder, denoiser, args.seconds,
                 f"[THEM] impostor clip {i+1} of {args.impostors}",
                 ["The OTHER person talks. You stay completely silent.",
                  "They sit where they normally sit, at their normal distance.",
-                 "Have them talk at a NORMAL to LOUD level, not quietly. The",
-                 "cutoff is calibrated against how loud they actually get, so",
-                 "a whispered impostor clip sets it too permissive."],
-                device=args.device, channel=args.channel)
-            embs, _ = clip_embeddings(encoder, denoiser, wav)
+                 "Have them talk at a NORMAL to LOUD level, not quietly, and",
+                 "keep talking for the whole clip. The cutoff is calibrated",
+                 "against how loud they actually get, so a quiet clip sets it",
+                 "too permissive and they leak through when they get animated."],
+                args.device, args.channel, MIN_WINDOWS_PER_CLIP)
+            if wav is None:
+                continue
             save_clip(args.clip_dir, "_impostors", i + 1, wav)
             others.append(embs)
-        other_sims = np.concatenate(others) @ centroid
+        if not others:
+            print("\nNo usable impostor clips, so no cutoff could be measured. "
+                  f"Falling back to the placeholder {DEFAULT_THRESHOLD}; tune it "
+                  f"with live.py --monitor.")
+        other_sims = np.concatenate(others) @ centroid if others else None
+
+    if args.impostors and other_sims is not None:
         hi = float(np.percentile(self_sims, SELF_PERCENTILE))
         lo = float(np.percentile(other_sims, IMPOSTOR_PERCENTILE))
         print(f"Impostor similarity: p{IMPOSTOR_PERCENTILE}={lo:.3f} "

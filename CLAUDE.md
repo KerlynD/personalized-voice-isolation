@@ -112,8 +112,24 @@ are non-causal and cannot be used as-is.
 - `models/` — downloaded weights
 - `*.wav` — debug recordings contain real speech
 
-## No measurements exist yet
+## What has and has not been measured
 
-Nothing in this repo has been benchmarked. Do not write performance claims into
-the README, and do not assert that any approach works or fails until it has
-been run on real recordings from the target room.
+Measured, on real recordings from the target room:
+
+- Zero-shot TSE transfer. See "Where the project actually is" for the numbers
+  and the caveats. Two sessions, one room, one day.
+- Enrollment separability. A clean enrollment gave a +0.263 margin between the
+  enrolled speaker's 5th-percentile window and the interferer's 95th. A first
+  attempt gave -0.111, from a clip with a second voice audible on it plus a
+  threshold rule that keyed off a single worst window.
+
+Not measured, and not to be claimed:
+
+- Any latency figure. Nothing has been timed in the callback.
+- Gate accuracy in use. No false-reject or leak rate has been counted.
+- Anything about a causal or 48 kHz model, which does not exist yet.
+- Any other room, microphone, or interferer.
+
+Do not write performance claims into the README beyond the list above, and do
+not assert that an approach works or fails until it has been run on real
+recordings from the target room.
