@@ -17,11 +17,11 @@ OUT_PEAK = 0.89
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="probe.py",
+        prog="python -m pvi.probe",
         description="Offline speaker-conditioned extraction on a real capture. "
                     "Non-causal, 8 kHz, far slower than real time.",
         epilog="Run with --explain for how to read the result.")
-    p.add_argument("--debug-wav", help="stereo capture from live.py "
+    p.add_argument("--debug-wav", help="stereo capture from pvi.live "
                                        "--record-debug (L=raw, R=gated)")
     p.add_argument("--explain", action="store_true",
                    help="print the four outcomes and what each one implies")
@@ -29,7 +29,7 @@ def build_parser():
     p.add_argument("--speaker", default=None,
                    help="which enrolled speaker to extract; defaults to the first")
     p.add_argument("--clip-dir", default="clips",
-                   help="where enroll.py saved the reference recordings")
+                   help="where pvi.enroll saved the reference recordings")
     p.add_argument("--enroll-wav", default=None,
                    help="override the reference clips with one specific file")
     p.add_argument("--out-dir", default="probe_out")
@@ -90,7 +90,7 @@ def main(argv=None):
     speaker = args.speaker or (names[0] if names else None)
     if speaker is None and args.enroll_wav is None:
         raise SystemExit(
-            f"no {args.speakers} and no --enroll-wav. Run enroll.py first, or "
+            f"no {args.speakers} and no --enroll-wav. Run pvi.enroll first, or "
             f"pass --enroll-wav pointing at a clean solo recording.")
     if names and speaker not in names:
         raise SystemExit(f"{speaker!r} is not enrolled in {args.speakers}: {names}")
@@ -201,5 +201,5 @@ def main(argv=None):
 
     print("\nListen to _extracted against _mix, not against the 48 kHz original.")
     print("Find a stretch where two people talk at once; that is the experiment.")
-    print("  python probe.py --explain     # the four outcomes")
+    print("  python -m pvi.probe --explain     # the four outcomes")
     return 0

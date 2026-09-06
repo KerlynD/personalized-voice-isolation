@@ -23,7 +23,7 @@ MAX_ENROLL_SEC = 20.0
 
 
 def read_debug_wav(path):
-    """Read a live.py --record-debug capture. Returns (raw, gated, sr).
+    """Read a pvi.live --record-debug capture. Returns (raw, gated, sr).
 
     Stereo by contract: L is the raw mic before any gain, R is what actually
     went to the virtual device. `gated` is None for a mono file, which is
@@ -49,7 +49,7 @@ def find_enrollment(clip_dir, speaker):
             f"no enrollment clips in {d}.\n"
             f"The probe needs a WAVEFORM of {speaker} speaking alone, because "
             f"the extraction model learned its own speaker representation and "
-            f"cannot use an ECAPA vector. Either re-run enroll.py, which saves "
+            f"cannot use an ECAPA vector. Either re-run pvi.enroll, which saves "
             f"clips there, or pass --enroll-wav pointing at any clean solo "
             f"recording."
         )

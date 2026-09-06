@@ -76,7 +76,7 @@ def record_usable(encoder, denoiser, seconds, header, instructions,
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        prog="enroll.py",
+        prog="python -m pvi.enroll",
         description="Record reference clips and build a speaker voiceprint.")
     # Not required=True: argparse enforces that before --list-devices can be
     # handled, so listing devices would error out asking for a name you cannot
@@ -90,7 +90,7 @@ def build_parser():
                     help="input device index; use --list-devices to find it")
     ap.add_argument("--channel", type=int, default=0, metavar="N",
                     help="which input channel carries the mic, counting from 0. "
-                         "Must match live.py --in-channel, or you enroll on one "
+                         "Must match pvi.live --in-channel, or you enroll on one "
                          "microphone and run on another.")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--from-clips", action="store_true",
@@ -101,7 +101,7 @@ def build_parser():
                     help="append to an existing enrollment instead of replacing")
     ap.add_argument("--out", default="speakers.npz")
     ap.add_argument("--clip-dir", default="clips",
-                    help="where to save reference recordings for probe.py")
+                    help="where to save reference recordings for pvi.probe")
     return ap
 
 
@@ -126,7 +126,7 @@ def main(argv=None):
         print(sd.query_devices())
         print(f"\nNo --device given. Recording from the system default: "
               f"{default_in['name']!r}")
-        print("If that is not the microphone you will run live.py on, stop now "
+        print("If that is not the microphone you will run pvi.live on, stop now "
               "and pass --device. Enrolling on the wrong mic produces a gate "
               "that silently never opens.")
         input("[Enter] to continue with the default > ")
@@ -202,7 +202,7 @@ def main(argv=None):
               "rebuild without\n  re-recording anything else:\n")
         for f in suspect:
             print(f"      rm {f}")
-        print(f"      python enroll.py --name {args.name} --from-clips "
+        print(f"      python -m pvi.enroll --name {args.name} --from-clips "
               f"--device {args.device} --channel {args.channel} "
               f"--impostors {args.impostors}\n")
 
@@ -223,7 +223,7 @@ def main(argv=None):
         if not others:
             print(f"\nNo usable impostor clips, so no cutoff could be measured. "
                   f"Falling back to the placeholder {thr.DEFAULT_THRESHOLD}; "
-                  f"tune it with live.py --monitor.")
+                  f"tune it with `python -m pvi.live --monitor`.")
         else:
             other_sims = np.concatenate(others) @ centroid
             threshold, margin, floor, ceiling = thr.compute(self_sims, other_sims)
@@ -248,7 +248,7 @@ def main(argv=None):
     print(f"\nSaved {args.out}: {list(names)}  threshold={threshold:.3f}")
     print(f"Reference clips in {args.clip_dir}/{args.name}/")
     print("\nNext:")
-    print("  python live.py --list-devices")
-    print("  python live.py --in <mic> --out <cable> --monitor  "
+    print("  python -m pvi.live --list-devices")
+    print("  python -m pvi.live --in <mic> --out <cable> --monitor  "
           "# check the threshold before trusting it")
     return 0

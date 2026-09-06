@@ -110,6 +110,7 @@ are non-causal and cannot be used as-is.
   docstrings are part of the product.
 - No emoji in code, comments, docs, or commit messages.
 - No em-dashes.
+- 
 - Keep dependencies small. Every one is a barrier for someone running this on
   their own machine.
 - Tunable constants live at module top with a comment explaining the tradeoff.
@@ -134,7 +135,7 @@ Measured, on real recordings from the target room:
   attempt gave -0.111, from a clip with a second voice audible on it plus a
   threshold rule that keyed off a single worst window.
 
-Timing, from `bench.py` on an M-series Mac at one torch thread. The callback
+Timing, from `python -m pvi.bench` on an M-series Mac at one torch thread. The callback
 budget is 10.67 ms.
 
     DeepFilterNet, one frame        0.30 ms p50, 0.74 ms max      7% of budget
@@ -148,7 +149,7 @@ threads make it worse; torch.jit.trace buys 6%. DeepFilterNet is a comparable
 model running 100x faster through ONNX Runtime on the same machine, which is
 where the headroom is.
 
-Encoding the enrollment costs 37 ms per 3 s and scales linearly, and probe.py
+Encoding the enrollment costs 37 ms per 3 s and scales linearly, and pvi.probe
 pays it on every chunk. It produces a fixed 512-dim vector and is entirely
 cacheable.
 

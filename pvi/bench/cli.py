@@ -70,13 +70,13 @@ def report(name, ms, budget=None):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        prog="bench.py",
+        prog="python -m pvi.bench",
         description="Time each component against the audio callback budget.")
     ap.add_argument("--iters", type=int, default=DEFAULT_ITERS)
     ap.add_argument("--skip", nargs="*", default=[],
                     choices=["denoiser", "ecapa", "tse"])
     ap.add_argument("--threads", type=int, default=1,
-                    help="torch threads. 1 is what live.py uses; raise it to "
+                    help="torch threads. 1 is what pvi.live uses; raise it to "
                          "see what an offline path could do.")
     ap.add_argument("--backend", default=None,
                     help="extraction backend to time; defaults to tse.DEFAULT")

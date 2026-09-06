@@ -58,7 +58,7 @@ evaluation-only and cannot ship. ESPnet publishes its own TD-SpeakerBeam
 (Apache-2.0 code, CC-BY-4.0 weights) which separates *better* on the same
 recording. `pvi/tse/` keeps both behind one interface. Build on `espnet`.
 
-**Timing, from `bench.py`, one torch thread, callback budget 10.67 ms:**
+**Timing, from `python -m pvi.bench`, one torch thread, callback budget 10.67 ms:**
 
 ```
 DeepFilterNet, one frame        0.30 ms p50, 0.74 ms max      7% of budget
@@ -122,7 +122,7 @@ spending GPU time training it.
 4. **Verify numerically**, not by eye: the ONNX output must match the PyTorch
    output on the same input to within float tolerance. A silently wrong export
    that still produces plausible speech is the failure mode to guard against.
-5. **Re-run `bench.py`** and record the new number in `.claude/CLAUDE.md`.
+5. **Re-run `python -m pvi.bench`** and record the new number in `.claude/CLAUDE.md`.
 
 ### Success criterion
 
@@ -187,7 +187,7 @@ resampling either side, exactly as ECAPA already runs at 16 kHz today.
    non-causal ones at the same size, always. The question is how much, measured
    the way the probe measures: how far the interferer's score falls against how
    far the target's falls.
-5. Re-run `probe.py` on `session2.wav` with the new checkpoint as a third
+5. Re-run `python -m pvi.probe` on `session2.wav` with the new checkpoint as a third
    backend in `pvi/tse/`, and compare against the numbers at the top of this
    file.
 
@@ -304,7 +304,7 @@ other people install".
 - Nothing gets a performance claim until it has been measured on real
   recordings from the target room. This has already caught two wrong
   conclusions.
-- The probe is the arbiter. When something changes, run `probe.py` on
+- The probe is the arbiter. When something changes, run `python -m pvi.probe` on
   `session2.wav` and compare against the numbers at the top of this file.
 - Enrollment and inference share one preprocessing path. Breaking that raises
   nothing and silently invalidates every threshold.

@@ -17,9 +17,9 @@ This probe decided which. The answer, measured on two real recordings, was
 streaming engineering: the released models transfer zero-shot. See
 docs/PLAN.md.
 
-    enroll.py   ->  speakers.npz + clips/<name>/*.wav
-    live.py     ->  session.wav   (--record-debug, L=raw mic, R=gated output)
-    probe.py    ->  probe_out/*.wav, to listen to
+    python -m pvi.enroll   ->  speakers.npz + clips/<name>/*.wav
+    python -m pvi.live     ->  session.wav  (--record-debug, L=raw, R=gated)
+    python -m pvi.probe    ->  probe_out/*.wav, to listen to
 
 It remains useful for any new backend, any new room, and any new microphone.
 It is offline, non-causal, 8 kHz and far slower than real time, and none of

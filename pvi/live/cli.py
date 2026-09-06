@@ -14,7 +14,7 @@ from .pipeline import Pipeline
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        prog="live.py",
+        prog="python -m pvi.live",
         description="Realtime personal voice gate: mic -> denoise -> gate -> "
                     "virtual output.")
     ap.add_argument("--list-devices", action="store_true")
@@ -40,7 +40,7 @@ def build_parser():
                     help="print live similarity, use this to tune the threshold")
     ap.add_argument("--record-debug", default=None, metavar="WAV",
                     help="write a stereo wav: L=raw mic, R=gated output. This "
-                         "is your evaluation data and probe.py's input. Listen "
+                         "is your evaluation data and pvi.probe's input. Listen "
                          "for false rejects (your speech cut) and leaks (their "
                          "speech through).")
     return ap
@@ -113,10 +113,10 @@ def main(argv=None):
             # Skip the first few seconds of the overlap: one person is usually
             # still finishing a sentence while the other starts.
             print("\nRun the probe on the overlap:")
-            print(f"  python probe.py --debug-wav {args.record_debug} "
+            print(f"  python -m pvi.probe --debug-wav {args.record_debug} "
                   f"--start {both_at + 5:.0f} --dur 30")
         else:
             print("Find a stretch where two people talk at once, then:")
-            print(f"  python probe.py --debug-wav {args.record_debug} "
+            print(f"  python -m pvi.probe --debug-wav {args.record_debug} "
                   f"--start <seconds> --dur 30")
     return 0

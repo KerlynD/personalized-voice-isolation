@@ -42,6 +42,6 @@ def open_stream(inp, out, in_channel, out_channels, callback):
             f"On macOS this usually means the mic and the virtual cable are "
             f"separate devices on separate clocks. Open Audio MIDI Setup, "
             f"create an Aggregate Device containing both, and pass its index "
-            f"for --in and --out. `python live.py --list-devices` will show it "
+            f"for --in and --out. `python -m pvi.live --list-devices` will show it "
             f"once it exists."
         ) from e

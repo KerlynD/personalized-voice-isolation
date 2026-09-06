@@ -37,7 +37,7 @@ THRESHOLD_BIAS = 0.35
 
 # Used when no impostor clips were recorded. A placeholder, not a calibration.
 # Cosine similarity runs roughly 0.2 to 0.8 in practice and the useful value
-# depends on microphone and room, so tune it with `live.py --monitor`.
+# depends on microphone and room, so tune it with `python -m pvi.live --monitor`.
 DEFAULT_THRESHOLD = 0.35
 
 
