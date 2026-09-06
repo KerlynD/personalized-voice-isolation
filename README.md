@@ -15,12 +15,18 @@ when you are not the one talking. It does not separate voices: when somebody
 talks at the same time as you, the gate is open and both voices pass through.
 
 Handling that overlap needs a speaker-conditioned mask over the mixture, not a
-gate. `probe.py` is the step before building one. It runs a pretrained
-extraction model offline on a recording from your own room and lets you hear
-whether such a model transfers to this acoustic condition at all, which decides
-whether the remaining work is streaming engineering or model fine-tuning.
+gate. `probe.py` tests whether a pretrained extraction model can do that on
+audio from your own room, offline, before anyone builds a realtime one.
 
-Nothing here has been benchmarked. There are no performance claims to make yet.
+On the author's setup it can. With two people talking over each other at
+similar volume, the audio the model discards scores 0.602 against the
+interferer's voiceprint and 0.063 against the enrolled speaker's: it is
+removing the right person. That is one room on one day, and the model tested is
+non-causal, runs at 8 kHz, and is far slower than real time, so it is evidence
+that the approach transfers and not a working realtime filter. Run the probe on
+your own recordings rather than taking this on trust.
+
+Nothing else here has been benchmarked. There are no latency numbers.
 
 ## Install
 
