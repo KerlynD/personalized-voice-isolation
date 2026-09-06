@@ -38,6 +38,7 @@ or model fine-tuning. **Do not start either until the probe is run.**
 - `live.py` — realtime loop: mic -> denoise -> gate -> virtual output
 - `tse.py` — extraction backends for the probe, and their licences
 - `probe.py` — offline extraction test on real recordings
+- `bench.py` — timing against the callback budget
 
 The realtime harness (48 kHz capture, virtual device routing, non-blocking
 callback, ring buffer, resampling, enrollment, debug capture) is reusable as-is
@@ -125,12 +126,37 @@ Measured, on real recordings from the target room:
   attempt gave -0.111, from a clip with a second voice audible on it plus a
   threshold rule that keyed off a single worst window.
 
+Timing, from `bench.py` on an M-series Mac at one torch thread. The callback
+budget is 10.67 ms.
+
+    DeepFilterNet, one frame        0.30 ms p50, 0.74 ms max      7% of budget
+    ECAPA, one 1.5 s window        13.50 ms      (analysis thread, 200 ms apart)
+    TSE extractor, one call        ~24 ms        225% of budget
+
+The extractor number is nearly independent of how much audio you give it: 10.7
+ms, 32 ms and 64 ms chunks all cost about the same. It is 130 Conv1d layers at
+roughly 190 us each, so it is PyTorch per-op dispatch and not arithmetic. More
+threads make it worse; torch.jit.trace buys 6%. DeepFilterNet is a comparable
+model running 100x faster through ONNX Runtime on the same machine, which is
+where the headroom is.
+
+Encoding the enrollment costs 37 ms per 3 s and scales linearly, and probe.py
+pays it on every chunk. It produces a fixed 512-dim vector and is entirely
+cacheable.
+
+**The gate is not redundant.** On the interferer-only phase of a real
+recording, the extractor attenuates by 1.1 dB where the gate attenuates by 34.
+TD-SpeakerBeam was trained on Libri2Mix, where the target is present in every
+mixture, so it has never been taught what to do when the target is silent. The
+mask estimator handles overlap; the gate handles absence. They are different
+problems and the product needs both.
+
 Not measured, and not to be claimed:
 
-- Any latency figure. Nothing has been timed in the callback.
 - Gate accuracy in use. No false-reject or leak rate has been counted.
 - Anything about a causal or 48 kHz model, which does not exist yet.
 - Any other room, microphone, or interferer.
+- End-to-end latency. Only per-component compute has been timed.
 
 Do not write performance claims into the README beyond the list above, and do
 not assert that an approach works or fails until it has been run on real
