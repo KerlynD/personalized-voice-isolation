@@ -449,6 +449,31 @@ def load_centroids(path):
     return names, mat.astype(np.float32)
 
 
+def centroid_from_clips(encoder, paths):
+    """Build an ECAPA centroid from raw clips, for the control speaker.
+
+    speakers.npz only holds people you enrolled. The interferer is deliberately
+    not enrolled, but scoring against them is what turns "did anything change?"
+    into "did THEIR voice get quieter?", so their centroid is derived here.
+    Deliberately skips the denoiser, matching score_against: the probe measures
+    the extractor, and inserting DeepFilterNet would confound that.
+    """
+    embs = []
+    for path in paths:
+        x, sr = sf.read(path, dtype="float32", always_2d=True)
+        x = resample_to(x.mean(axis=1), sr, dsp.ANALYSIS_SR)
+        for i in range(0, max(1, len(x) - int(dsp.WINDOW_SEC * dsp.ANALYSIS_SR) + 1),
+                       int(dsp.ENROLL_HOP_SEC * dsp.ANALYSIS_SR)):
+            w = x[i:i + int(dsp.WINDOW_SEC * dsp.ANALYSIS_SR)]
+            if len(w) < int(dsp.WINDOW_SEC * dsp.ANALYSIS_SR):
+                break
+            embs.append(dsp.embed(encoder, w))
+    if not embs:
+        return None
+    c = np.mean(embs, axis=0)
+    return (c / (np.linalg.norm(c) + 1e-9)).astype(np.float32)
+
+
 def score_against(encoder, centroids, wav8):
     """Cosine similarity of an 8 kHz clip against the enrolled centroids.
 
@@ -598,9 +623,16 @@ def main(argv=None):
     print(f"\nextracted vs mixture: correlation "
           f"{np.corrcoef(est, mix)[0, 1]:+.4f}, removed energy {r_db:+.1f} dB")
 
+    encoder = None
+    def load_enc():
+        nonlocal encoder
+        if encoder is None:
+            encoder = dsp.load_encoder(device=a.device)
+        return encoder
+
     if cents is not None:
         print("\nECAPA similarity (relative only, see score_against docstring):")
-        encoder = dsp.load_encoder(device=a.device)
+        encoder = load_enc()
         s_mix = score_against(encoder, cents, mix)
         s_est = score_against(encoder, cents, est)
         print(f"  {'speaker':<20} {'mixture':>8} {'extracted':>10} {'delta':>8}")
@@ -629,6 +661,37 @@ def main(argv=None):
             print(f"  wrote {f}")
             print(f"  target-conditioned vs control-conditioned: "
                   f"correlation {same:+.4f}")
+
+            # The headline question. Comparing the interferer's score in the
+            # mixture against their score in the extraction answers "did THEIR
+            # voice get quieter", which no single-speaker number can.
+            if cents is not None:
+                enc2 = load_enc()
+                c_cent = centroid_from_clips(enc2, cpaths)
+                if c_cent is not None:
+                    t_cent = cents[names.index(speaker)]
+                    print(f"\n  {'file':<12}{'target':>9}{'other':>9}  leans")
+                    rows = {}
+                    for tag, sig in (("mix", mix), ("extracted", est),
+                                     ("removed", mix - est), ("control", c_est)):
+                        e = dsp.embed(enc2, resample_to(sig, PROBE_SR, dsp.ANALYSIS_SR))
+                        a, b = float(t_cent @ e), float(c_cent @ e)
+                        rows[tag] = (a, b)
+                        print(f"  {tag:<12}{a:>9.3f}{b:>9.3f}  "
+                              f"{'target' if a > b else 'OTHER'}")
+                    duck = rows["extracted"][1] - rows["mix"][1]
+                    print(f"\n  interferer's score, mixture -> extracted: {duck:+.3f}")
+                    if duck < -0.05:
+                        print("  Their voice moved away from the output. That is "
+                              "ducking, which is the\n  result this probe exists "
+                              "to find.")
+                    else:
+                        print("  Their voice did not move away from the output. "
+                              "With the conditioning\n  proven to work by the "
+                              "correlation above, that means this recording did "
+                              "not\n  ask the model to do anything: record one "
+                              "where both voices are equally\n  loud before "
+                              "concluding either way.")
             if same > 0.9:
                 print("  The two are nearly identical, so the enrollment is not "
                       "changing the answer.\n  Whatever came out is the model "
