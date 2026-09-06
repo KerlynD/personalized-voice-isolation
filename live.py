@@ -68,6 +68,20 @@ VAD_RMS = 0.004       # below this the room is quiet; nobody is talking
 # the actual call.
 DEBUG_QUEUE_FRAMES = 256
 
+# The scripted session --guide walks you through, as (seconds, what to do).
+#
+# Only the BOTH phase is the experiment. The single-speaker phases are controls:
+# they let you hear what the gate does correctly, so that when you listen to the
+# overlap you are judging the extraction and not re-judging the gate. Sixty
+# seconds of genuine overlap is enough to find several usable stretches; going
+# longer mostly adds probe runtime, since the model is far slower than realtime.
+PROBE_SCRIPT = [
+    (20.0, "YOU alone"),
+    (20.0, "THEM alone"),
+    (60.0, "BOTH at once, talk over each other"),
+    (20.0, "YOU alone"),
+]
+
 
 class Ring:
     """Circular buffer written by the audio callback, read by the analysis
@@ -285,6 +299,58 @@ class Pipeline:
             self._debug_thread.join(timeout=5.0)
 
 
+def mmss(t):
+    return f"{int(t) // 60}:{int(t) % 60:02d}"
+
+
+def run_guided(p, script):
+    """Walk the operator through a timed session, printing where they are.
+
+    Everything prints from here rather than from the analysis thread, because
+    both would be writing the same terminal line with \r and the result is
+    unreadable. Pipeline.monitor is forced off when this runs.
+    """
+    phases, t = [], 0.0
+    for dur, label in script:
+        phases.append((t, t + dur, label))
+        t += dur
+    total = t
+
+    print("\nSession plan:")
+    for a, b, label in phases:
+        print(f"    {mmss(a)} - {mmss(b)}   {label}")
+    print(f"\n  Total {mmss(total)}. It stops on its own. Ctrl+C stops early and")
+    print("  the recording so far is still usable.")
+    for i in (3, 2, 1):
+        print(f"  starting in {i}...", flush=True)
+        time.sleep(1.0)
+
+    start = time.time()
+    current = -1
+    try:
+        while True:
+            el = time.time() - start
+            if el >= total:
+                break
+            i = next(j for j, (a, b, _) in enumerate(phases) if el < b)
+            if i != current:
+                current = i
+                # Bell plus a full line: you will be talking, not reading the
+                # screen, when a phase changes.
+                print(f"\n\a>>> {mmss(phases[i][0])}  {phases[i][2]}", flush=True)
+            left = phases[i][1] - el
+            bar = "#" * int(max(0.0, p.score) * 30)
+            print(f"\r  {mmss(el)}/{mmss(total)}  {left:4.0f}s left   "
+                  f"sim={p.score:+.3f} gain={p.gain:.2f}  {bar:<30}",
+                  end="", flush=True)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n  stopped early")
+        return time.time() - start
+    print(f"\n\a  done")
+    return total
+
+
 def open_stream(inp, out, in_channel, out_channels, callback):
     """Open the duplex stream, with a readable failure for the common macOS case.
 
@@ -331,6 +397,10 @@ def main():
                          "or Discord hears you in one ear.")
     ap.add_argument("--speakers", default="speakers.npz")
     ap.add_argument("--threshold", type=float, default=None)
+    ap.add_argument("--guide", action="store_true",
+                    help="run the scripted probe session: prints a clock, tells "
+                         "you who should be talking, and stops on its own. Use "
+                         "with --record-debug.")
     ap.add_argument("--monitor", action="store_true",
                     help="print live similarity, use this to tune the threshold")
     ap.add_argument("--record-debug", default=None, metavar="WAV",
@@ -363,17 +433,21 @@ def main():
           f"{','.join(str(c) for c in out_channels)}")
 
     p = Pipeline(names, centroids, threshold,
-                 monitor=args.monitor, debug=args.record_debug,
+                 monitor=args.monitor and not args.guide,
+                 debug=args.record_debug,
                  in_channel=args.in_channel, out_channels=out_channels)
     threading.Thread(target=p.analyze, daemon=True).start()
 
     with open_stream(args.inp, args.out, args.in_channel, out_channels, p.callback):
-        print("running - Ctrl+C to stop")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
+        if args.guide:
+            run_guided(p, PROBE_SCRIPT)
+        else:
+            print("running - Ctrl+C to stop")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
     # Outside the `with`: the stream is closed and the callback has stopped, so
     # the debug writer can drain what is left without racing new frames in.
     p.close()
@@ -387,9 +461,22 @@ def main():
         print(f"{p.debug_drops} debug frames dropped; the writer could not keep up")
     if args.record_debug:
         print(f"\nwrote {args.record_debug}")
-        print("Find a stretch where two people talk at once, then:")
-        print(f"  python probe.py --debug-wav {args.record_debug} "
-              f"--speaker {names[0]}")
+        if args.guide:
+            # Point the probe straight at the overlap. Skip the first few
+            # seconds of it, which are usually one person still finishing a
+            # sentence while the other starts.
+            t = 0.0
+            for dur, label in PROBE_SCRIPT:
+                if label.startswith("BOTH"):
+                    break
+                t += dur
+            print("Run the probe on the overlap:")
+            print(f"  python probe.py --debug-wav {args.record_debug} "
+                  f"--start {t + 5:.0f} --dur 30")
+        else:
+            print("Find a stretch where two people talk at once, then:")
+            print(f"  python probe.py --debug-wav {args.record_debug} "
+                  f"--start <seconds> --dur 30")
 
 
 if __name__ == "__main__":
