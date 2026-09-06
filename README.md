@@ -26,7 +26,8 @@ non-causal, runs at 8 kHz, and is far slower than real time, so it is evidence
 that the approach transfers and not a working realtime filter. Run the probe on
 your own recordings rather than taking this on trust.
 
-Nothing else here has been benchmarked. There are no latency numbers.
+Component timings are in `docs/PLAN.md`. End-to-end latency has not been
+measured and there is no realtime mask estimator yet.
 
 ## Install
 
@@ -73,17 +74,29 @@ the result:
 python -c "import probe; print(probe.__doc__)"
 ```
 
-## Files
+## Layout
 
-| file | what it does |
-| --- | --- |
-| `dsp.py` | shared signal path: encoder, denoiser, resampling, scoring |
-| `enroll.py` | records reference clips, builds speaker centroids |
-| `live.py` | realtime loop: mic to denoise to gate to virtual output |
-| `probe.py` | offline test of a pretrained mask estimator on your recordings |
+The four scripts at the root are thin entry points. The code lives in `pvi/`.
+
+```
+enroll.py  live.py  probe.py  bench.py     entry points
+pvi/
+  dsp/        shared signal path: constants, resampling, embeddings, denoiser
+  enroll/     recording, clip analysis, threshold, speakers.npz
+  live/       ring buffer, realtime pipeline, devices, guided session
+  tse/        extraction backends and their licences
+  probe/      offline extraction test and its reporting
+  bench/      timing against the audio callback budget
+docs/PLAN.md            where this is going, phase by phase
+.claude/CLAUDE.md       invariants that must not be broken
+```
+
+Everything imports `pvi.dsp` and nothing reimplements any part of it. Enrollment
+and inference drifting apart is this project's classic silent bug: it raises
+nothing and quietly invalidates every threshold.
 
 `speakers.npz` holds enrollment centroids. They are biometric data, and they are
-gitignored. So are `models/` and every `.wav`.
+gitignored. So are `models/`, `clips/` and every `.wav`.
 
 ## Licence
 

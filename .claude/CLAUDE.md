@@ -33,12 +33,20 @@ or model fine-tuning. **Do not start either until the probe is run.**
 
 ## Repo layout
 
-- `dsp.py` — shared signal path: encoder, denoiser, resampling, scoring
-- `enroll.py` — records reference clips, builds speaker centroids
-- `live.py` — realtime loop: mic -> denoise -> gate -> virtual output
-- `tse.py` — extraction backends for the probe, and their licences
-- `probe.py` — offline extraction test on real recordings
-- `bench.py` — timing against the callback budget
+The four scripts at the root are thin entry points into `pvi/`.
+
+- `pvi/dsp/` — shared signal path: constants, resampling, embeddings, denoiser
+- `pvi/enroll/` — recording, clip analysis, threshold, speakers.npz
+- `pvi/live/` — ring buffer, realtime pipeline, devices, guided session
+- `pvi/tse/` — extraction backends and their licences
+- `pvi/probe/` — offline extraction test and its reporting
+- `pvi/bench/` — timing against the callback budget
+- `docs/PLAN.md` — the phased plan from here to a shipped app
+
+Everything imports `pvi.dsp` and nothing reimplements any part of it. Each
+package keeps its tunable constants at the top of the module they belong to,
+with a comment explaining the tradeoff, and its CLI in `cli.py` doing
+orchestration only.
 
 The realtime harness (48 kHz capture, virtual device routing, non-blocking
 callback, ring buffer, resampling, enrollment, debug capture) is reusable as-is
